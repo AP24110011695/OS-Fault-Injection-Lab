@@ -1,0 +1,10 @@
+services:
+  lab:
+    build: .
+    image: os-fault-injection-lab
+    container_name: os-fault-lab
+    privileged: true
+    volumes:
+      - .:/app
+      - ./results:/app/results
+    command: python -m target.heartbeat_app

@@ -1,0 +1,12 @@
+# Results
+results/*.jsonl
+results/*.csv
+results/*.png
+!results/.gitkeep
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment
+.env
