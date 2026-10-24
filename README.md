@@ -1,85 +1,67 @@
 # OS Fault Injection Lab
 
-A self-contained Linux fault injection, health monitoring, automated recovery, and empirical measurement framework. Built entirely in Python, running safely inside a Docker container using Linux kernel primitives: signals, `/proc`, `psutil`, `stress-ng`, and `cgroups v2`.
+A self-contained Linux fault injection, health monitoring, automated recovery, and empirical measurement framework. Built entirely in Python, running safely inside a Docker container using Linux kernel primitives: signals, `/proc`, cgroups v2, tmpfs, `psutil`, and `stress-ng`.
 
 ---
 
-## 1. Motivation
+## 1. What It Does
 
-Operating systems must remain resilient under severe failure modes: processes crash without warning, memory leaks trigger kernel out-of-memory kills, and compute-heavy processes saturate CPU cores. While students encounter these topics conceptually in operating systems courses, they rarely observe kernel schedulers and resource controllers handling real faults firsthand.
+Operating systems must tolerate faults: processes crash, hang, exhaust memory, file descriptors, disk space, and CPU. Students learn these topics conceptually but rarely observe the kernel handling them firsthand. This project injects realistic OS faults deliberately, detects them automatically, recovers from them, and measures **MTTD** (mean time to detect) and **MTTR** (mean time to recover) across randomized trials — inside a disposable container, so the host is never at risk.
 
-This project creates a safe, repeatable laboratory environment to:
-1. **Inject** realistic operating system faults deliberately.
-2. **Monitor** system telemetry and detect faults automatically.
-3. **Recover** service availability through automated self-healing mechanisms.
-4. **Measure** detection latency (MTTD) and recovery latency (MTTR) across multiple randomized trials.
-5. **Visualize** the findings through publication-quality charts.
-
-Everything executes inside a single Docker container. Fault injection is restricted to container resources, ensuring the host system is never modified or endangered.
+Every fault follows the same measured loop: `INJECTED → DETECTED → RECOVERED`, written to a shared JSONL event log that is the only communication channel between components.
 
 ---
 
-## 2. Implemented Faults & OS Concepts
+## 2. The Seven Faults
 
-The framework implements three distinct fault injection scenarios, each highlighting specific Linux kernel subsystems:
-
-| Fault Type | Injection Mechanism | Detection Mechanism | Recovery Action | Key OS Concepts |
+| Fault | How it is injected | How it is detected | How it is recovered | OS concept learned |
 |---|---|---|---|---|
-| **Process Kill** | `os.kill(pid, signal.SIGKILL)` | Polling loop checking PID status, handling zombie child processes | Process supervisor re-launches target with cooldown and retry limits | Unix signals (`SIGKILL` vs. `SIGTERM`), PIDs, zombie processes (`STATUS_ZOMBIE`), process table reaping |
-| **Memory Pressure** | Background worker allocates memory inside isolated cgroup v2 with hard cap (`memory.max = 64MB`, `swap = 0`) | Continuous polling of `memory.current / memory.max` and monotonic `oom_kill` counter in `memory.events` | OOM killer terminates hog; supervisor reaps and removes cgroup directory | Cgroups v2 hierarchy, memory controllers, OOM killer victim selection, swap suppression |
-| **CPU Hog** | `stress-ng --cpu N` saturating all available CPU cores | Sustained CPU utilization above 90% for 3 consecutive polling intervals (debouncing) | Recursive termination of `stress-ng` process tree and zombie reaping | Completely Fair Scheduler (CFS), virtual runtime (`vruntime`), load average vs. CPU percentage |
+| **Process Kill** | `os.kill(pid, SIGKILL)` on the target | Target PID gone or zombie (`psutil`) | Supervisor restart with retries + cooldown | Signals, PID lifecycle, supervision |
+| **Memory Pressure** | Memory hog inside a cgroup v2 with hard `memory.max` (swap off) | cgroup `memory.current/memory.max` ratio + `oom_kill` counter in `memory.events` | Kill/confirm hog dead, remove cgroup, restart target if affected | Cgroups v2, OOM killer, swap |
+| **CPU Hog** | `stress-ng --cpu N` saturating all cores | `psutil.cpu_percent()` above 90% for 3 consecutive polls | Kill the stress-ng tree, verify CPU drops | CFS scheduling, load average, debouncing |
+| **Process Hang** | `SIGSTOP` freezes the target (still alive) | **Heartbeat staleness** — no fresh timestamp within 3s; deliberately not a liveness check | Resume (`SIGCONT`) or restart; `RECOVERED` only after a fresh heartbeat | Process states, alive vs healthy, `SIGSTOP`/`SIGCONT` |
+| **Disk Full** | Size-capped tmpfs (16MB) mounted and filled to `ENOSPC` | `psutil.disk_usage().percent` above 90% for 3 polls | Kill writer, delete files, verify usage drops, unmount | Mounts, tmpfs, `ENOSPC`, `df` vs `du` |
+| **FD Exhaustion** | Leaker lowers **its own** `RLIMIT_NOFILE` to 256, opens `/dev/null` until `EMFILE` | `num_fds()` / own soft limit above 90% for 3 polls | Kill and reap leaker, start fresh instance, verify low fd count | fd table, rlimits, `EMFILE`, `/proc/<pid>/fd` |
+| **Zombie Leak** | Parent `os.fork()`s short-lived children it never reaps (capped at 200) | Leaker's direct children in `STATUS_ZOMBIE` above 20 for 3 polls | Kill parent, reap orphans adopted by PID 1, verify zero zombies | Zombies vs orphans, reparenting, why init reaps |
 
 ---
 
 ## 3. Architecture & Data Flow
 
-The architecture follows a strict separation of concerns, communicating exclusively through a shared append-only JSON Lines event log.
-
 ```
-       +---------------------------------------------+
-       |             experiment.runner               |
-       |  (Trial Orchestration & Jitter Scheduling)  |
-       +----------------------+----------------------+
-                              |
-     +------------------------+------------------------+
-     |                        |                        |
-     v                        v                        v
-+------------+         +-------------+          +--------------+
-|  injector  |         |   monitor   |          |   recovery   |
-| (SIGKILL / |         |  (Polling   |          | (Supervisor  |
-| Memory /   |         |  detector / |          |  & Resource  |
-| stress-ng) |         |  cgroups)   |          |  Reclaiming) |
-+-----+------+         +------+------+          +-------+------+
-      |                       |                         |
-      |   INJECTED            |   DETECTED              |   RECOVERED
-      +---------------------->+------------------------>+
-                              |
-                              v
-                  +-----------------------+
-                  | results/event_log.jsonl|
-                  +-----------+-----------+
-                              |
-                              v
-                  +-----------------------+
-                  |  experiment.metrics   |
-                  |     (MTTD & MTTR)     |
-                  +-----------+-----------+
-                              |
-                              v
-                  +-----------------------+
-                  |  experiment.results   |
-                  | (CSV & Matplotlib)    |
-                  +-----------------------+
+     +---------------------------------------------+
+     |              experiment.runner               |
+     |  (Trial orchestration, random pre-injection  |
+     |   jitter, per-trial cleanup + verification)  |
+     +----------------------+----------------------+
+                            |
+     +----------------------+----------------------+
+     |                      |                      |
+     v                      v                      v
++------------+      +-------------+        +--------------+
+|  injector  |      |   monitor   |        |   recovery   |
+| (signals,  |      | (polling +  |        | (supervisor  |
+| cgroups,   |      |  detector   |        |  & resource  |
+| tmpfs,     |      |  branches)  |        |  reclaiming) |
+| forks)     |      +------+------+        +-------+------+
++-----+------+             |                       |
+      |   INJECTED         | DETECTED              | RECOVERED
+      +------------------->+---------------------->+
+                           v
+                +------------------------+
+                | results/event_log.jsonl|
+                +-----------+------------+
+                            v
+                +------------------------+
+                | experiment.metrics     |  MTTD / MTTR per trial
+                +-----------+------------+
+                            v
+                +------------------------+
+                | experiment.results     |  results.csv + 4 charts
+                +------------------------+
 ```
 
-### The Shared Event Log
-
-Components write to `results/event_log.jsonl` with atomic appends and immediate flushes. Each entry contains:
-- `timestamp`: ISO 8601 high-resolution timestamp.
-- `trial_id`: Trial identifier (e.g., `process_kill_001`).
-- `fault_type`: One of `process_kill`, `memory_pressure`, or `cpu_hog`.
-- `event`: Lifecycle event (`STARTED`, `INJECTED`, `DETECTED`, `RECOVERED`, `FAILED`).
-- `details`: Human-readable diagnostics (PIDs, breach percentages, counters).
+The monitor always starts **before** injection, and injection is delayed by a uniform random jitter, so MTTD is never phase-locked to the polling cycle.
 
 ---
 
@@ -87,209 +69,120 @@ Components write to `results/event_log.jsonl` with atomic appends and immediate 
 
 ```
 OS Fault Injection Lab/
-├── config.py                 # Central configuration tunables (no magic numbers)
-├── event_log.py              # Shared JSONL event log reader and writer
-├── Dockerfile                # Debian slim container with stress-ng & procps
-├── docker-compose.yml        # Privileged Docker configuration mounting results/
-├── requirements.txt          # Python dependencies: psutil, matplotlib
-├── docs/                     # Engineering specifications & viva study notes
-│   ├── images/               # Publication charts
-│   │   ├── mttd_by_fault.png
-│   │   ├── mttr_by_fault.png
-│   │   ├── success_rate.png
-│   │   └── mttd_vs_mttr.png
-│   ├── prd.md                # Product requirements document
-│   ├── architecture.md       # Architectural blueprint & module contracts
-│   ├── rules.md              # Coding standards and operating protocol
-│   ├── design.md             # Visual design system (palette, charts, tables)
-│   ├── tasks.md              # 10-phase task breakdown and progress tracker
-│   ├── memory.md             # Project decisions log and state history
-│   ├── process_kill_notes.md # Learning notes: signals, zombies, supervision
-│   ├── oom_killer_notes.md   # Learning notes: cgroups v2, memory.events, OOM
-│   └── cpu_scheduling_notes.md # Learning notes: CFS, load avg vs. CPU percent
-├── target/                   # Target workload application
-│   ├── __init__.py
-│   └── heartbeat_app.py      # Heartbeat process simulating an active service
-├── injector/                 # Fault injection engines
-│   ├── __init__.py
-│   ├── process_kill.py       # SIGKILL process crash injector
-│   ├── memory_pressure.py    # Cgroup memory limit & hog allocator
-│   └── cpu_hog.py            # stress-ng CPU saturation engine
-├── monitor/                  # Telemetry and anomaly detection
-│   ├── __init__.py
-│   ├── detector.py           # Threshold evaluations & zombie detection
-│   └── monitor.py            # Polling loop measuring CPU, memory, and liveness
-├── recovery/                 # Self-healing engines
-│   ├── __init__.py
-│   ├── supervisor.py         # Process restart supervisor with retry & cooldown
-│   └── resource_recovery.py  # Hog process termination and cgroup reclamation
-├── experiment/               # Trial orchestration, metrics, and visualization
-│   ├── __init__.py
-│   ├── runner.py             # Orchestrates trials with random pre-injection jitter
-│   ├── metrics.py            # Computes MTTD, MTTR, and statistical aggregates
-│   └── results.py            # Writes CSV data and generates publication charts
-├── scripts/                  # Utility scripts
-│   ├── safety_check.py       # Pre-flight container isolation & safety verification
-│   └── demo.py               # Interactive single-command demonstration
-├── tests/                    # Unit test suite (Python standard unittest)
-│   ├── __init__.py
-│   ├── test_event_log.py     # Event log atomic append, read, filter, clear
-│   ├── test_metrics.py       # MTTD/MTTR calculation and aggregates logic
-│   ├── test_detector.py      # CPU debouncing and cgroup threshold logic
-│   └── test_supervisor.py    # Supervisor retry, cooldown, and liveness checks
-└── results/                  # Generated experiment outputs (gitignored)
-    ├── .gitkeep
-    ├── event_log.jsonl       # Raw trial events
-    ├── results.csv           # Tabular per-trial metrics
-    ├── mttd_by_fault.png     # Publication chart: MTTD by fault type
-    ├── mttr_by_fault.png     # Publication chart: MTTR by fault type
-    ├── success_rate.png      # Publication chart: Recovery success rate
-    └── mttd_vs_mttr.png      # Publication chart: MTTD vs. MTTR correlation
+├── config.py                 # All tunables (thresholds, paths, caps — no magic numbers)
+├── event_log.py              # Shared JSONL event log
+├── injector/                 # One module per fault (7)
+├── monitor/                  # monitor.py polling loop + detector.py threshold logic
+├── recovery/                 # supervisor.py (process restart/resume) + resource_recovery.py
+├── experiment/               # runner.py (orchestration), metrics.py (MTTD/MTTR), results.py (CSV + charts)
+├── target/                   # heartbeat_app.py — the victim service (writes heartbeat timestamps)
+├── scripts/                  # safety_check.py (pre-flight), demo.py (one-command demo)
+├── tests/                    # 40 unit tests (stdlib unittest)
+├── docs/                     # PRD, architecture, design, notes per fault, images/
+└── results/                  # Generated outputs (gitignored): event_log.jsonl, results.csv, charts
 ```
 
 ---
 
-## 5. Prerequisites & Safety
+## 5. Safety Guarantees
 
-### Requirements
-- Docker and Docker Compose installed on the host (Linux, macOS, or Windows with WSL2).
-- No Python installation required on the host (everything runs in the container).
-
-### Safety Guarantee
-Fault injection commands (`kill -9`, memory limits, CPU hogs) **must never run directly on the host operating system**. 
-
-The framework enforces this safety barrier via `scripts/safety_check.py`:
-- Checks for container isolation markers (`/.dockerenv`).
-- Verifies cgroups v2 availability (`/sys/fs/cgroup/cgroup.controllers`).
-- Verifies `stress-ng` and `psutil` availability.
-- Immediately halts with exit code 1 if invoked outside Docker.
+- **Container only.** `scripts/safety_check.py` verifies Docker isolation, cgroups v2, stress-ng, psutil, and tmpfs mounting — and refuses to run (exit 1) on the host.
+- **tmpfs only.** The disk_full fault writes exclusively to a size-capped tmpfs verified via `/proc/mounts` (path, filesystem type, and size option); a failed mount aborts the trial. The mount is removed after every trial, including on Ctrl+C.
+- **Per-process rlimit only.** The fd_exhaustion leaker lowers `RLIMIT_NOFILE` for its own process via `resource.setrlimit`; no system-wide limit is ever touched.
+- **Capped zombies.** The zombie_leak parent spawns at most 200 children at a controlled rate — the container's PID table is never at risk.
+- **Cleanup after every trial.** The runner kills all child processes, removes cgroups and mounts, reaps zombies, and asserts that nothing was left behind before starting the next trial.
 
 ---
 
-## 6. How to Run
+## 6. Quick Start
 
-### 1. Pre-flight Safety Verification
 ```bash
-# Inside container (passes):
+# 1. Pre-flight safety verification (passes in Docker, fails on the host by design):
 docker compose run --rm lab python scripts/safety_check.py
 
-# On host (fails by design, protecting the host system):
-python scripts/safety_check.py
-```
-
-### 2. Run the Interactive Demonstration
-Executes a quick trial of each fault type, updates CSV results, and generates publication charts in seconds:
-```bash
+# 2. One-command demo: 1 trial per fault group + summary + charts:
 docker compose run --rm lab python scripts/demo.py
-```
 
-### 3. Run the Full 45-Trial Experiment Suite
-Runs 15 trials per fault type (45 total trials) with randomized pre-injection jitter:
-```bash
+# 3. Full suite: 7 faults x 15 trials (process_hang runs both strategies) = 120 trials:
 docker compose run --rm lab python -m experiment.runner --fault all --trials 15
-```
 
-### 4. Run an Individual Fault Type
-```bash
-# Process kill (15 trials):
-docker compose run --rm lab python -m experiment.runner --fault process_kill --trials 15
+# 4. A single fault:
+docker compose run --rm lab python -m experiment.runner --fault disk_full --trials 15
 
-# Memory pressure (15 trials):
-docker compose run --rm lab python -m experiment.runner --fault memory_pressure --trials 15
-
-# CPU hog (15 trials):
-docker compose run --rm lab python -m experiment.runner --fault cpu_hog --trials 15
-```
-
-### 5. Regenerate Charts Standalone
-Regenerate all charts from `results/results.csv` without re-running experiments:
-```bash
+# 5. Regenerate the 4 charts from results/results.csv without re-running:
 docker compose run --rm lab python -m experiment.results
-```
 
-### 6. Run the Unit Test Suite
-Execute all 22 unit tests using standard library `unittest`:
-```bash
+# 6. Unit tests (40, stdlib unittest):
 docker compose run --rm lab python -m unittest discover tests -v
 ```
 
 ---
 
-## 7. Sample Experimental Results
+## 7. Results
 
-Below are representative empirical results obtained from a 45-trial suite (15 trials per fault type):
+Computed from `results/results.csv` — 120 trials across 8 groups (7 faults; process_hang measured once per recovery strategy), 15 trials each, **100% recovery success**:
 
-```
-Results: process_kill (15 trials)
+| Fault group | MTTD mean (s) | MTTR mean (s) | Recovery cost (s) | Success |
+|---|---|---|---|---|
+| Process Kill | 0.258 | 0.365 | 0.107 | 100% |
+| Memory Pressure | 0.733 | 0.739 | 0.006 | 100% |
+| CPU Hog | 1.760 | 1.883 | 0.123 | 100% |
+| Process Hang (resume) | 3.016 | 3.059 | 0.043 | 100% |
+| Process Hang (restart) | 3.149 | 3.259 | 0.110 | 100% |
+| Disk Full | 1.953 | 1.963 | 0.010 | 100% |
+| FD Exhaustion | 5.968 | 6.082 | 0.114 | 100% |
+| Zombie Leak | 2.327 | 2.334 | 0.007 | 100% |
+
+MTTD includes each fault's own ramp-up time (configured fill/leak/spawn speed) plus the detection debounce, so it is not a fair measure of recovery quality — recovery cost (MTTR − MTTD) is compared in the recovery-time chart, and it sits between 0.006s and 0.123s for every fault.
+
 ---
-                    Mean    Median      Min      Max
-  MTTD (sec)        0.272     0.345    0.021    0.481
-  MTTR (sec)        0.379     0.451    0.126    0.590
-  Success rate     100.0%
 
-Results: memory_pressure (15 trials)
----
-                    Mean    Median      Min      Max
-  MTTD (sec)        0.898     0.826    0.526    1.745
-  MTTR (sec)        0.923     0.844    0.530    1.769
-  Success rate     100.0%
-
-Results: cpu_hog (15 trials)
----
-                    Mean    Median      Min      Max
-  MTTD (sec)        1.811     1.839    1.559    2.042
-  MTTR (sec)        2.044     1.982    1.674    2.398
-  Success rate     100.0%
-```
-
-### Publication Charts
+## 8. Charts
 
 | Detection Latency (MTTD) | Recovery Latency (MTTR) |
 |:---:|:---:|
 | ![MTTD by Fault](docs/images/mttd_by_fault.png) | ![MTTR by Fault](docs/images/mttr_by_fault.png) |
 
-| Automated Recovery Success Rate | MTTD vs. MTTR Correlation |
+| Automated Recovery Success Rate | Recovery Cost After Detection (MTTR − MTTD) |
 |:---:|:---:|
-| ![Recovery Success Rate](docs/images/success_rate.png) | ![MTTD vs MTTR](docs/images/mttd_vs_mttr.png) |
-
-### Scientific Explanation of Latency Differences
-
-1. **Process Kill (Mean MTTD: 0.272s)**
-   - `os.kill(pid, SIGKILL)` terminates execution in less than 1 millisecond.
-   - The monitor polls process liveness at interval $T_{\text{poll}} = 0.5\text{s}$.
-   - Uniform pre-injection jitter $[0, 0.5\text{s}]$ simulates arbitrary fault arrival, causing MTTD to distribute continuously across $[0, 0.5\text{s}]$ with an observed mean of $0.272\text{s}$, closely matching the theoretical expected mean of $T_{\text{poll}} / 2 = 0.250\text{s}$.
-
-2. **Memory Pressure (Mean MTTD: 0.898s)**
-   - Memory cannot be exhausted instantaneously. The memory hog allocates 8MB bytearrays every 50ms, requiring approximately $0.40\text{s}$ to allocate sufficient resident memory to breach the 64MB cgroup limit.
-   - Observed MTTD represents the physical memory allocation ramp-up latency ($\sim 0.40\text{s}$) plus the monitor polling phase delay ($\sim 0.25\text{s}-0.50\text{s}$).
-
-3. **CPU Hog (Mean MTTD: 1.811s)**
-   - While `stress-ng` saturates CPU cores immediately, instantaneous CPU spikes are common in real systems.
-   - To prevent false alarms, the detector applies a **3-poll debounce filter** (`CONSECUTIVE_POLLS_THRESHOLD = 3`).
-   - 3 consecutive polls at 0.5s intervals establish a hard minimum baseline of $1.50\text{s}$. Adding the initial polling phase offset yields an observed mean MTTD of $1.811\text{s}$.
-
-4. **Self-Healing MTTR Dynamics**
-   - In all fault types, recovery action overhead (restarting target process or unlinking cgroups / terminating stress-ng) requires a constant $\sim 0.08\text{s}-0.23\text{s}$.
-   - Because recovery begins immediately upon detection, MTTR is directly governed by MTTD: $\text{MTTR} \approx \text{MTTD} + \Delta t_{\text{recovery}}$.
+| ![Recovery Success Rate](docs/images/success_rate.png) | ![Recovery Time by Fault](docs/images/recovery_time_by_fault.png) |
 
 ---
 
-## 8. Viva & Examination Q&A Reference
+## 9. Limitations
 
-1. **Q: Why can't we use `psutil.virtual_memory()` to detect memory pressure in containers?**
-   - *A:* `psutil.virtual_memory()` parses `/proc/meminfo`, which exposes the host machine's total physical RAM (e.g., 16GB or 32GB). It is unaware of container or cgroup boundaries. If a container is restricted to 64MB, `psutil` will still report gigabytes of free memory. Real container-aware monitoring must read `/sys/fs/cgroup/memory.current` and `/sys/fs/cgroup/memory.max`.
+Written honestly:
 
-2. **Q: Why does `psutil.pid_exists(pid)` return `True` for crashed processes?**
-   - *A:* When a process terminates, its kernel task structure remains in the process table in state `STATUS_ZOMBIE` until the parent reaps it via `waitpid()`. Because the PID exists in `/proc`, `psutil.pid_exists(pid)` returns `True`. Fault detectors must inspect process status (`proc.status() == psutil.STATUS_ZOMBIE`) and treat zombies as dead.
-
-3. **Q: Why is load average unsuitable for real-time fault detection compared to CPU percentage?**
-   - *A:* Load average is an exponentially damped 1-, 5-, and 15-minute moving average of runnable tasks. It takes minutes to rise under sudden load and minutes to decay after recovery. Detecting active CPU starvation requires instantaneous window sampling (`psutil.cpu_percent(interval=None)`).
-
-4. **Q: How does the heartbeat target survive 100% CPU saturation without dropping ticks?**
-   - *A:* The Linux Completely Fair Scheduler (CFS) allocates CPU time based on virtual runtime (`vruntime`). The CPU hog runs tight computation loops, causing its `vruntime` to increase rapidly. The heartbeat sleeps for 1.0s, accumulating zero `vruntime`. When it wakes, CFS immediately preempts the hog and schedules the heartbeat.
+- **One container, one laptop.** All faults are controlled simulations inside a single Docker container on one machine. Absolute numbers (MTTD/MTTR) vary with the host — the *relative* differences and mechanisms are the findings, not the milliseconds.
+- **15 trials per group.** Enough to show a stable distribution, not a rigorous statistical study.
+- **100% success ≠ real-world robustness.** The recovery mechanisms work for the faults as injected; real failures arrive with partial state, concurrent causes, and network effects that this lab does not model.
+- **Resume vs restart is within noise.** The two process_hang strategies differ by ~0.07s in recovery cost — not a meaningful gap; the interesting difference (resume keeps possibly-corrupt state) is qualitative, not measured here.
+- **One fault at a time.** Faults are never combined; cascading failures are out of scope.
 
 ---
 
-## 9. License
+## 10. Viva Q&A
 
-Educational project developed for Operating Systems studies. Available under the MIT License.
+**Q: Why can't we use `psutil.virtual_memory()` to detect memory pressure in containers?**
+It reads the whole-VM memory and cannot see a cgroup's `memory.max`. The lab reads `memory.current`/`memory.max` from the cgroup filesystem and the `oom_kill` counter from `memory.events` instead.
+
+**Q: A process is "alive" — is it healthy? (process hang)**
+No. A `SIGSTOP`'d process keeps its PID, memory, and sockets but makes no progress. Liveness checks (`pid_exists`, status) pass, so health needs a progress signal: the target writes heartbeat timestamps to a file, and the monitor fires when none is fresh within 3 seconds.
+
+**Q: What is the difference between `SIGSTOP` and `SIGKILL`?**
+Neither can be caught or ignored. `SIGKILL` terminates the process; `SIGSTOP` freezes it in place — it still holds all resources. Consequence for cleanup: a stopped process **queues** `SIGTERM` instead of handling it, so the only reliable way to remove a frozen target is `SIGKILL` (or `SIGCONT` first).
+
+**Q: What happens when a disk fills up? (ENOSPC)**
+The kernel starts returning `ENOSPC` ("no space left on device") from writes — the process is not killed, it just keeps failing. The lab mounts a size-capped tmpfs (RAM-backed filesystem) so the fault is bounded and vanishes on unmount. Near the full mark, writes may partially succeed, which is why the recovery deletes everything in the mount.
+
+**Q: What is EMFILE and why do leaking services fail "slowly, then suddenly"? (fd exhaustion)**
+Each process has its own file-descriptor table with a per-process ceiling (`RLIMIT_NOFILE`). When every fd is taken, `open()`/`socket()` returns `EMFILE` — the process still runs but cannot accept connections or open files. Leaks accumulate gradually, so the service passes every check until it suddenly cannot work; rlimits are per-process and inherited, never system-wide.
+
+**Q: What is a zombie, and why did killing the parent not remove the zombies?**
+A zombie is a terminated process whose exit status is still unread — the parent never called `wait()`. When the parent dies, the zombies are **reparented to PID 1**; in this container PID 1 is the Python runner, which does not reap automatically (that is the job of a real init). Recovery therefore reaps them explicitly (`os.waitpid(-1, WNOHANG)`) and then *verifies* the zombie count is zero.
+
+**Q: Why does the monitor start before the fault is injected, with random jitter?**
+MTTD must include the wait for the next poll after the fault begins. A fixed delay phase-locks injection to the polling cycle (every trial would detect at ~0.45s); uniform random jitter in `[0, poll_interval]` simulates arbitrary fault arrival and yields an honest expected MTTD of ~half the poll interval.
+
+**Q: How do you know nothing leaked after the experiments?**
+After every trial — and after every full run — the runner asserts zero leftover processes, stopped processes, zombies, tmpfs mounts, and cgroups, and reports the container root filesystem's usage delta (unchanged).

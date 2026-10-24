@@ -13,8 +13,12 @@ import event_log
 from injector.process_kill import inject
 from monitor.detector import (
     detect_cpu_hog,
+    detect_disk_full,
+    detect_fd_exhaustion,
     detect_memory_pressure,
     detect_process_death,
+    detect_process_hang,
+    detect_zombie_leak,
     is_process_alive,
 )
 
@@ -79,6 +83,34 @@ def monitor_process(
         elif fault_type == "cpu_hog":
             detected, consecutive_breaches = detect_cpu_hog(
                 cpu_percent=metrics["cpu_percent"],
+                trial_id=trial_id,
+                consecutive_breaches=consecutive_breaches,
+            )
+            if detected:
+                return True
+        elif fault_type == "process_hang":
+            # Heartbeat staleness only: the PID is still alive while stopped
+            if detect_process_hang(Path(config.HEARTBEAT_FILE_PATH), trial_id):
+                return True
+        elif fault_type == "disk_full":
+            detected, consecutive_breaches = detect_disk_full(
+                mount_path=Path(config.DISK_MOUNT_PATH),
+                trial_id=trial_id,
+                consecutive_breaches=consecutive_breaches,
+            )
+            if detected:
+                return True
+        elif fault_type == "fd_exhaustion":
+            detected, consecutive_breaches = detect_fd_exhaustion(
+                pid=pid,
+                trial_id=trial_id,
+                consecutive_breaches=consecutive_breaches,
+            )
+            if detected:
+                return True
+        elif fault_type == "zombie_leak":
+            detected, consecutive_breaches = detect_zombie_leak(
+                parent_pid=pid,
                 trial_id=trial_id,
                 consecutive_breaches=consecutive_breaches,
             )

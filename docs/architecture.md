@@ -5,17 +5,29 @@
 ```
 OS Fault Injection Lab/
 ├── docs/                    # All documentation (you are here)
+│   ├── images/              # Publication charts embedded in the README
 │   ├── prd.md
 │   ├── architecture.md
 │   ├── rules.md
 │   ├── design.md
 │   ├── tasks.md
-│   └── memory.md
+│   ├── memory.md
+│   ├── process_kill_notes.md
+│   ├── oom_killer_notes.md
+│   ├── cpu_scheduling_notes.md
+│   ├── process_hang_notes.md
+│   ├── disk_full_notes.md
+│   ├── fd_exhaustion_notes.md
+│   └── zombie_leak_notes.md
 ├── injector/                # Fault injection modules
 │   ├── __init__.py
 │   ├── process_kill.py      # Kill target with SIGKILL
 │   ├── memory_pressure.py   # Launch memory hog inside cgroup
-│   └── cpu_hog.py           # Launch stress-ng CPU load
+│   ├── cpu_hog.py           # Launch stress-ng CPU load
+│   ├── process_hang.py      # Freeze target with SIGSTOP
+│   ├── disk_full.py         # Mount size-capped tmpfs, fill it to ENOSPC
+│   ├── fd_exhaustion.py     # Lower own RLIMIT_NOFILE, leak fds to EMFILE
+│   └── zombie_leak.py       # Parent that never reaps its exiting children
 ├── monitor/                 # System health monitoring + detection
 │   ├── __init__.py
 │   ├── monitor.py           # Polling loop: reads psutil, checks thresholds
@@ -35,12 +47,19 @@ OS Fault Injection Lab/
 ├── config.py                # Central configuration (all constants in one place)
 ├── event_log.py             # Shared event log: write/read CSV or JSONL
 ├── scripts/
-│   └── safety_check.py      # Pre-run checks: are we in Docker? cgroups available?
+│   ├── safety_check.py      # Pre-run checks: Docker? cgroups? stress-ng? tmpfs mount?
+│   └── demo.py              # One-command demo: 1 trial per fault group + charts
+├── tests/                   # Unit tests (stdlib unittest, no external framework)
+│   ├── test_event_log.py
+│   ├── test_metrics.py
+│   ├── test_detector.py
+│   ├── test_supervisor.py
+│   └── test_results.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
-├── results/                 # Output directory (gitignored except .gitkeep)
-│   └── .gitkeep
+├── results/                 # Generated outputs (gitignored except .gitkeep):
+│   └── .gitkeep             #   event_log.jsonl, results.csv, *.png, heartbeat.log
 └── README.md
 ```
 
@@ -66,6 +85,23 @@ RESULTS_CSV_PATH = "results/results.csv"
 CGROUP_MEMORY_LIMIT_MB = 64
 STRESS_NG_CPU_WORKERS = os.cpu_count()  # default: all available CPUs
 TARGET_CMD = ["python", "-m", "target.heartbeat_app"]
+
+# Process hang (Phase 11)
+HEARTBEAT_FILE_PATH = "results/heartbeat.log"  # target appends heartbeat timestamps here
+
+# Disk full (Phase 12)
+DISK_FAULT_SIZE_MB = 16               # size-capped tmpfs
+DISK_MOUNT_PATH = "/tmp/fault_disk"   # tmpfs mountpoint inside the container
+DISK_THRESHOLD_PERCENT = 90.0
+
+# FD exhaustion (Phase 13)
+FD_LIMIT = 256                        # leaker's own RLIMIT_NOFILE
+FD_THRESHOLD_PERCENT = 90.0
+FD_CLEAN_MAX_FDS = 20                 # fresh-instance verification bound
+
+# Zombie leak (Phase 14)
+ZOMBIE_LEAK_MAX_CHILDREN = 200        # hard cap on spawned children
+ZOMBIE_THRESHOLD = 20
 ```
 
 ### `event_log.py` — Shared Event Log
@@ -89,7 +125,7 @@ to and reads events from one JSONL file.
 |-------------|--------|--------|
 | `timestamp` | ISO 8601 string | `datetime.now().isoformat()` |
 | `trial_id`  | string | `{fault_type}_{zero-padded number}`, e.g. `memory_pressure_003` |
-| `fault_type`| string | `process_kill`, `memory_pressure`, `cpu_hog` |
+| `fault_type`| string | `process_kill`, `memory_pressure`, `cpu_hog`, `process_hang`, `disk_full`, `fd_exhaustion`, `zombie_leak` |
 | `event`     | string | `INJECTED`, `DETECTED`, `RECOVERED`, `FAILED`, `STARTED`, `CLEANUP` |
 | `details`   | string | Human-readable description of what happened |
 
@@ -117,6 +153,10 @@ Each injector module exposes one function: `inject(target_pid, trial_id) -> None
 | `process_kill.py`    | Calls `os.kill(target_pid, signal.SIGKILL)`. Logs `INJECTED`. |
 | `memory_pressure.py` | Starts a memory-hungry child process inside a cgroup with a hard memory limit. Logs `INJECTED`. |
 | `cpu_hog.py`         | Starts `stress-ng --cpu N` as a subprocess. Logs `INJECTED`. |
+| `process_hang.py`    | Sends `SIGSTOP` to the target. Logs `INJECTED`. |
+| `disk_full.py`       | Mounts a size-capped tmpfs at `DISK_MOUNT_PATH`, verifies it via `/proc/mounts`, then starts a writer that fills it to `ENOSPC`. Aborts the trial if the mount cannot be verified. Logs `INJECTED`. |
+| `fd_exhaustion.py`   | Provides the faulty service: it lowers its own `RLIMIT_NOFILE` to `FD_LIMIT` at startup and, on `SIGUSR1`, opens `/dev/null` until `EMFILE` and keeps running. Logs `INJECTED`. |
+| `zombie_leak.py`     | Provides the leaker parent which, on `SIGUSR1`, `os.fork()`s up to `ZOMBIE_LEAK_MAX_CHILDREN` short-lived children it never reaps. Logs `INJECTED`. |
 
 ### `monitor/` — Monitoring + Detection
 
@@ -130,20 +170,28 @@ Each injector module exposes one function: `inject(target_pid, trial_id) -> None
 - **Process kill**: target PID gone OR heartbeat not updated within timeout → `DETECTED`.
 - **Memory pressure**: cgroup `memory.current / memory.max` ratio > threshold for N consecutive polls, OR `oom_kill` counter incremented → `DETECTED`.
 - **CPU hog**: CPU percent > threshold for N consecutive polls → `DETECTED`.
+- **Process hang**: target PID is alive but its heartbeat file has no fresh timestamp within `HEARTBEAT_TIMEOUT_SEC` → `DETECTED`. A liveness check would never fire here — the PID still exists; that is the point of the fault.
+- **Disk full**: `psutil.disk_usage(DISK_MOUNT_PATH).percent` > `DISK_THRESHOLD_PERCENT` for N consecutive polls → `DETECTED`.
+- **FD exhaustion**: leaker's `Process.num_fds()` / `RLIMIT_NOFILE` ratio > `FD_THRESHOLD_PERCENT` for N consecutive polls → `DETECTED`.
+- **Zombie leak**: count of the leaker's own children in `STATUS_ZOMBIE` > `ZOMBIE_THRESHOLD` for N consecutive polls → `DETECTED`. Only the leaker's children are counted.
 
 On detection, `log_event(... "DETECTED" ...)` is called.
 
 ### `recovery/` — Self-Healing
 
-`supervisor.py`:
-- Restarts the target process.
+`supervisor.py` — recovers faults where a process must be resumed or (re)started:
+- Restarts the target process (process_kill).
 - Retries up to `SUPERVISOR_MAX_RETRIES` with `SUPERVISOR_COOLDOWN_SEC` between attempts.
 - Verifies the new process is alive before logging `RECOVERED`.
+- Applies the two process_hang strategies: "resume" (`SIGCONT`) and "restart" (`restart_target()`); `RECOVERED` is logged only after a fresh heartbeat is observed.
+- Recovers fd_exhaustion: kills the leaker, starts a fresh clean instance, verifies its fd count is low.
 
-`resource_recovery.py`:
+`resource_recovery.py` — recovers resource-exhaustion faults:
 - Kills `stress-ng` or memory-hog processes by PID or name.
 - Verifies resource levels return to normal.
 - Logs `RECOVERED`.
+- Recovers disk_full: kills the writer, deletes its files, verifies usage drops below the threshold, unmounts the tmpfs in cleanup.
+- Recovers zombie_leak: kills the unreaping parent, reaps orphaned zombies, verifies zero zombies remain.
 
 ### `experiment/runner.py` — Trial Orchestration
 
@@ -230,6 +278,8 @@ t5     runner              Cleanup, pause                  CLEANUP
 - **Installed inside:** `psutil`, `stress-ng`, `matplotlib`.
 - **Volumes:** `./results` is mounted so output files persist after the container stops.
 - **Privileges:** The container needs `--privileged` or `SYS_ADMIN` capability to manipulate cgroups inside the container. This is documented and justified.
+- **tmpfs mounts (disk_full):** the size-capped tmpfs is mounted inside the container at `DISK_MOUNT_PATH`; privileged mode makes this possible. Nothing is ever mounted or written on the host.
+- **PID 1 (zombie_leak):** with `docker compose run`, the Python runner is PID 1. Python does not automatically reap children adopted by PID 1, so zombie_leak recovery either reaps them explicitly (reusing `reap_zombie_children()`) or the compose file sets `init: true` so Docker's init reaps them. The choice is made in Phase 14 and recorded in `memory.md`.
 
 ### cgroups (v2)
 
@@ -267,6 +317,21 @@ t5     runner              Cleanup, pause                  CLEANUP
    - `SIGINT` (Ctrl+C) during an experiment triggers cleanup of all child processes and cgroups
      before exiting.
 
+6. **tmpfs-only disk fault.**
+   - The disk_full fault writes only to the size-capped tmpfs mounted at `DISK_MOUNT_PATH`.
+   - Before any write, the injector verifies via `/proc/mounts` that the path is really that tmpfs
+     mountpoint. If the mount fails, the trial aborts — the writer never runs against the
+     container's normal filesystem.
+   - The tmpfs is unmounted and the mount directory removed after every trial, including on Ctrl+C.
+
+7. **Per-process rlimit only.**
+   - The fd_exhaustion leaker lowers `RLIMIT_NOFILE` only for its own process via
+     `resource.setrlimit`. System-wide limits are never touched.
+
+8. **Zombie cap.**
+   - The zombie_leak parent spawns at most `ZOMBIE_LEAK_MAX_CHILDREN` children, at a controlled
+     rate, so the container's process table is never at risk.
+
 ---
 
 ## File-Level Dependency Map
@@ -274,7 +339,7 @@ t5     runner              Cleanup, pause                  CLEANUP
 ```
 config.py ──────────────── used by everything
 event_log.py ──────────── used by injector, monitor, recovery, experiment
-target/heartbeat_app.py ── standalone (no imports from project)
+target/heartbeat_app.py ── imports: config (writes heartbeat timestamps to HEARTBEAT_FILE_PATH)
 injector/* ────────────── imports: config, event_log, os, signal, subprocess
 monitor/* ─────────────── imports: config, event_log, psutil
 recovery/* ────────────── imports: config, event_log, psutil, subprocess
@@ -285,3 +350,19 @@ scripts/safety_check.py ─ imports: os, sys (standalone)
 ```
 
 No circular dependencies. The dependency graph is a DAG rooted at `experiment/runner.py`.
+
+---
+
+## Fault Reference — All Seven Faults
+
+How each fault is injected, detected, and recovered. Written for the teacher/reviewer.
+
+| Fault | Injected by | Detected by | Recovered by |
+|-------|-------------|-------------|--------------|
+| `process_kill` | `os.kill(pid, SIGKILL)` on the target (`injector/process_kill.py`) | Target PID gone or zombie (`monitor/detector.py`) | Supervisor restart with retries + cooldown (`recovery/supervisor.py`) |
+| `memory_pressure` | Memory hog inside a cgroup with hard `memory.max` limit, swap off (`injector/memory_pressure.py`) | cgroup `memory.current/memory.max` ratio over N polls, or `oom_kill` counter in `memory.events` | Kill hog, verify target health, remove cgroup (`recovery/resource_recovery.py`) |
+| `cpu_hog` | `stress-ng --cpu N --timeout T` (`injector/cpu_hog.py`) | `psutil.cpu_percent()` ≥ threshold for N polls | Kill the stress-ng process tree, verify CPU drops below threshold (`recovery/resource_recovery.py`) |
+| `process_hang` | `SIGSTOP` to the target (`injector/process_hang.py`) | Heartbeat staleness: no fresh heartbeat within `HEARTBEAT_TIMEOUT_SEC` (PID still alive) | Strategy "resume" (`SIGCONT`) or "restart" (supervisor); `RECOVERED` only after a fresh heartbeat (`recovery/supervisor.py`) |
+| `disk_full` | Size-capped tmpfs mounted at `DISK_MOUNT_PATH`, writer fills it to `ENOSPC` (`injector/disk_full.py`) | `psutil.disk_usage(mount).percent` ≥ `DISK_THRESHOLD_PERCENT` for N polls | Kill writer, delete its files, verify usage drops, unmount tmpfs in cleanup (`recovery/resource_recovery.py`) |
+| `fd_exhaustion` | Leaker lowers its own `RLIMIT_NOFILE` to `FD_LIMIT`, opens files until `EMFILE` (`injector/fd_exhaustion.py`) | `num_fds()` / `RLIMIT_NOFILE` ratio ≥ `FD_THRESHOLD_PERCENT` for N polls | Kill leaker, start a fresh clean instance, verify low fd count (`recovery/supervisor.py`) |
+| `zombie_leak` | Parent spawns capped short-lived children it never reaps (`injector/zombie_leak.py`) | Leaker's own zombie children > `ZOMBIE_THRESHOLD` for N polls | Kill parent, reap orphaned zombies, verify zero zombies remain (`recovery/resource_recovery.py`) |

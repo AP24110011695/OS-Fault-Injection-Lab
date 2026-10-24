@@ -401,3 +401,247 @@ docker compose up --build
 - How to do a final code review and clean up.
 - How to present a complete project: from problem statement to results.
 - Confidence to explain every component in a viva.
+
+---
+
+## Phase 11: Process Hang Fault
+
+**Goal:** Implement process hang injection (`SIGSTOP`), heartbeat-staleness detection, and two compared recovery strategies (resume vs restart).
+
+**Tasks:**
+- [x] Add `HEARTBEAT_FILE_PATH` to `config.py` and make the smallest possible change to `target/heartbeat_app.py`: append the current timestamp to the heartbeat file on each tick. Reset the file at trial start so staleness is measured only against the current run.
+- [x] Write `injector/process_hang.py`: send `SIGSTOP` to the target, log `INJECTED`.
+- [x] Extend `monitor/detector.py`: detect heartbeat staleness — no fresh timestamp within `config.HEARTBEAT_TIMEOUT_SEC`. Do NOT use a PID liveness check: the target is still alive while stopped, and that is the lesson.
+- [x] Implement both recovery strategies in `recovery/supervisor.py`: "resume" (send `SIGCONT`, verify heartbeats resume) and "restart" (`SIGKILL` + `restart_target()`).
+- [x] Log `RECOVERED` only after a fresh heartbeat is observed (both strategies).
+- [x] Choose the simplest way to record the strategy per trial (e.g., embed it in the trial id) so MTTR can be compared per strategy; record the decision in `memory.md`.
+- [x] Update `experiment/runner.py` to orchestrate `process_hang` trials, with a strategy choice in the CLI (simplest option consistent with `--fault`, e.g. `--strategy resume|restart`).
+- [x] Add unit tests for the heartbeat-staleness detector (fresh heartbeat → no detection; stale heartbeat after N polls → detection).
+- [x] Run the experiment: 15 trials per strategy.
+- [x] Run the full unit test suite and a quick smoke trial of at least one existing fault (e.g., `--fault process_kill --trials 1`) to prove nothing broke.
+
+**Files touched:** `config.py`, `target/heartbeat_app.py`, `injector/process_hang.py`, `monitor/detector.py`, `monitor/monitor.py`, `recovery/supervisor.py`, `experiment/runner.py`, `tests/`.
+
+**Definition of done:**
+- process_hang runs end-to-end: inject → detect → recover, with `RECOVERED` logged only after a fresh heartbeat.
+- Both recovery strategies work and MTTR is comparable per strategy in the results.
+- Detection does not rely on PID liveness.
+- All unit tests pass; the existing-fault smoke trial succeeds.
+- Results CSV includes process_hang rows for both strategies.
+
+**How to verify:**
+```bash
+docker compose run lab python -m injector.process_hang
+# Target freezes (alive but no heartbeats), detector fires on staleness.
+docker compose run lab python -m experiment.runner --fault process_hang --strategy resume --trials 15
+docker compose run lab python -m experiment.runner --fault process_hang --strategy restart --trials 15
+docker compose run lab python -m unittest discover tests -v
+```
+
+**What the student should learn:**
+- Process states: running, sleeping, stopped, zombie — and how `SIGSTOP`/`SIGCONT` move a process between them.
+- "Alive" (PID exists) vs "healthy" (making progress): why liveness checks miss hangs.
+- How heartbeat/health-check timeouts trade detection speed against false positives.
+- Why recovery must be verified (a fresh heartbeat) before declaring success.
+- How to compare two recovery strategies with data instead of intuition.
+
+---
+
+## Phase 12: Disk Full Fault
+
+**Goal:** Implement disk-full injection on a size-capped tmpfs, ENOSPC detection, and verified cleanup — with hard safety guarantees.
+
+**Tasks:**
+- [x] Add `DISK_FAULT_SIZE_MB`, `DISK_MOUNT_PATH`, and `DISK_THRESHOLD_PERCENT` to `config.py`.
+- [x] Write `injector/disk_full.py`: mount a tmpfs of `DISK_FAULT_SIZE_MB` at `DISK_MOUNT_PATH` inside the container.
+- [x] SAFETY (mandatory): before writing anything, verify via `/proc/mounts` that `DISK_MOUNT_PATH` is really the size-capped tmpfs mountpoint. If the mount fails, ABORT the trial. NEVER fall back to writing on the container's normal filesystem.
+- [x] Start a writer process that fills the tmpfs until the OS returns `ENOSPC`; log `INJECTED`.
+- [x] Extend `monitor/detector.py`: detect `psutil.disk_usage(DISK_MOUNT_PATH).percent` above `DISK_THRESHOLD_PERCENT` for N consecutive polls.
+- [x] Write recovery in `recovery/resource_recovery.py`: kill the writer, delete its files, verify usage drops below the threshold, then unmount the tmpfs in cleanup.
+- [x] Always unmount and remove the directory after every trial — including on Ctrl+C (graceful SIGINT path).
+- [x] Log `DETECTED` and `RECOVERED` events.
+- [x] Run the experiment: `--fault disk_full --trials 15`.
+- [x] Run the full unit test suite and a quick smoke trial of at least one existing fault to prove nothing broke.
+
+**Files touched:** `config.py`, `injector/disk_full.py`, `monitor/detector.py`, `monitor/monitor.py`, `recovery/resource_recovery.py`, `experiment/runner.py`, `tests/`.
+
+**Definition of done:**
+- disk_full runs end-to-end: inject → detect → recover.
+- The tmpfs safety check is proven: a failed mount aborts the trial and nothing is ever written outside the tmpfs.
+- After every trial (and after Ctrl+C) the tmpfs is unmounted and the mount directory removed; no leftover mounts.
+- 15 trials run with MTTD/MTTR data; results CSV includes disk_full rows.
+- All unit tests pass; the existing-fault smoke trial succeeds.
+
+**How to verify:**
+```bash
+docker compose run lab python -m injector.disk_full
+# Writer fills the tmpfs, ENOSPC occurs, cleanup unmounts.
+docker compose run lab python -m experiment.runner --fault disk_full --trials 15
+mount | grep fault_disk   # inside the container: should show nothing after the run
+docker compose run lab python -m unittest discover tests -v
+```
+
+**What the student should learn:**
+- What filesystems and mount points are, and how mounting works in Linux.
+- What tmpfs is (RAM-backed filesystem) and why it makes disk-fault injection safe and disposable.
+- What `ENOSPC` is and how the OS reports "no space left on device".
+- `df` vs `du`: filesystem usage vs directory usage, and why they can disagree.
+- Why verifying preconditions (mountpoint checks) before destructive operations matters.
+
+---
+
+## Phase 13: FD Exhaustion Fault
+
+**Goal:** Implement file-descriptor exhaustion in a single isolated process, ratio-based detection, and clean-instance recovery.
+
+**Tasks:**
+- [x] Add `FD_LIMIT` and `FD_THRESHOLD_PERCENT` to `config.py`.
+- [x] Write `injector/fd_exhaustion.py`: start a leaker process (the faulty service) that lowers ITS OWN limit with `resource.setrlimit(resource.RLIMIT_NOFILE, FD_LIMIT)` and keeps opening files until it hits `EMFILE` (handle `EMFILE` and keep running). The limit applies only to that process, never to the system.
+- [x] Log `INJECTED`.
+- [x] Extend `monitor/detector.py`: detect the leaker's `psutil.Process.num_fds()` divided by its `RLIMIT_NOFILE` limit above `FD_THRESHOLD_PERCENT` for N consecutive polls.
+- [x] Write recovery in `recovery/supervisor.py`: kill the leaking process, start a fresh clean instance, verify its fd count is low, then log `RECOVERED`.
+- [x] Run the experiment: `--fault fd_exhaustion --trials 15`.
+- [x] Run the full unit test suite and a quick smoke trial of at least one existing fault to prove nothing broke.
+
+**Files touched:** `config.py`, `injector/fd_exhaustion.py`, `monitor/detector.py`, `monitor/monitor.py`, `recovery/supervisor.py`, `experiment/runner.py`, `tests/`.
+
+**Definition of done:**
+- fd_exhaustion runs end-to-end: inject → detect → recover.
+- The rlimit change is proven to be per-process: other processes and the system are unaffected.
+- The leaker keeps running at the limit (EMFILE handled) until recovery kills it.
+- Recovery starts a fresh instance and verifies a low fd count before `RECOVERED`.
+- 15 trials run with MTTD/MTTR data; results CSV includes fd_exhaustion rows.
+- All unit tests pass; the existing-fault smoke trial succeeds.
+
+**How to verify:**
+```bash
+docker compose run lab python -m injector.fd_exhaustion
+# Leaker hits EMFILE and stays alive; detector fires on the fd ratio.
+docker compose run lab python -m experiment.runner --fault fd_exhaustion --trials 15
+docker compose run lab python -m unittest discover tests -v
+```
+
+**What the student should learn:**
+- What a file descriptor is and how each process owns its own fd table.
+- What `ulimit`/`RLIMIT_NOFILE` control and that rlimits are per-process (inherited, not system-wide).
+- How to inspect open fds via `psutil` and `/proc/<pid>/fd`.
+- What `EMFILE` means and why leaking services fail slowly, then suddenly.
+- Why recovery must verify the new instance is clean (low fd count), not just running.
+
+---
+
+## Phase 14: Zombie Leak Fault
+
+**Goal:** Implement zombie accumulation via an unreaping parent, count-only-this-parent detection, and verified zombie-free recovery including the PID 1 reaping check.
+
+**Tasks:**
+- [x] Add `ZOMBIE_LEAK_MAX_CHILDREN` and `ZOMBIE_THRESHOLD` to `config.py`.
+- [x] Write `injector/zombie_leak.py`: a parent process spawns short-lived children that exit immediately; the parent NEVER reaps them (never calls `wait`). Cap the total at `ZOMBIE_LEAK_MAX_CHILDREN` and spawn at a controlled rate so the PID table is never at risk.
+- [x] Log `INJECTED`.
+- [x] Extend `monitor/detector.py`: count zombie children of the leaker parent (`psutil` status `STATUS_ZOMBIE`) and detect when the count is above `ZOMBIE_THRESHOLD` for N consecutive polls. Count only the leaker's children so other processes cannot cause false alarms.
+- [x] Write recovery in `recovery/resource_recovery.py`: kill the parent.
+- [x] IMPORTANT: orphaned zombies get adopted by PID 1, and in this container PID 1 is the Python runner, which may not reap them. After recovery, VERIFY the zombies are really gone. Reuse the existing `reap_zombie_children()` or set `init: true` in `docker-compose.yml` — whichever is simpler — and record the decision in `memory.md`.
+- [x] Log `DETECTED` and `RECOVERED` events.
+- [x] Run the experiment: `--fault zombie_leak --trials 15`.
+- [x] Run the full unit test suite and a quick smoke trial of at least one existing fault to prove nothing broke.
+
+**Files touched:** `config.py`, `injector/zombie_leak.py`, `monitor/detector.py`, `monitor/monitor.py`, `recovery/resource_recovery.py`, `docker-compose.yml` (only if the `init: true` option is chosen), `experiment/runner.py`, `tests/`.
+
+**Definition of done:**
+- zombie_leak runs end-to-end: inject → detect → recover.
+- After recovery, zero zombies remain for the leaker (verified, not assumed).
+- The PID 1 reaping question is answered and the decision recorded in `memory.md`.
+- The child cap and spawn rate keep the container safe (at most `ZOMBIE_LEAK_MAX_CHILDREN` children total).
+- 15 trials run with MTTD/MTTR data; results CSV includes zombie_leak rows.
+- All unit tests pass; the existing-fault smoke trial succeeds.
+
+**How to verify:**
+```bash
+docker compose run lab python -m injector.zombie_leak
+# Zombies accumulate under the parent, detector fires, recovery leaves zero zombies.
+docker compose run lab python -m experiment.runner --fault zombie_leak --trials 15
+docker compose run lab python -m unittest discover tests -v
+```
+
+**What the student should learn:**
+- What a zombie process is (terminated but not reaped) and how it differs from an orphan.
+- How reparenting to PID 1 works when a parent dies.
+- Why init processes must reap children, and what accumulates when they do not.
+- How to count zombies precisely (only the leaker's children) to avoid false alarms.
+- Why the PID table is a finite kernel resource worth protecting (hence the cap).
+
+---
+
+## Phase 15: Integration — Seven-Fault Suite
+
+**Goal:** Wire all seven faults into the runner, results, charts, safety check, demo, and tests.
+
+**Tasks:**
+- [x] Extend `experiment/runner.py`: `--fault all` runs all seven faults (15 trials each; process_hang runs both strategies).
+- [x] Extend `experiment/results.py`: charts for 7 faults following the updated `design.md` (per-fault colors, horizontal-bar layouts for seven categories, direct labels).
+- [x] Update `scripts/safety_check.py` if needed for the new faults (e.g., tmpfs mount capability check).
+- [x] Update `scripts/demo.py`: runs all 7 faults (1 trial each, plus both process_hang strategies) and generates charts in one command.
+- [x] Extend the unit tests for the new detectors: heartbeat staleness, disk usage ratio, fd ratio, zombie count.
+- [x] Verify `results/results.csv` still accumulates rows across runs and keeps all faults (existing behavior, keyed on trial_id).
+- [x] Full run: `--fault all --trials 15` — 105 trials, charts generated, no errors.
+- [x] Cleanup verification after the full run: no leftover processes, no cgroups, no mounts, no zombies.
+
+**Files touched:** `experiment/runner.py`, `experiment/results.py`, `scripts/safety_check.py`, `scripts/demo.py`, `tests/`.
+
+**Definition of done:**
+- `--fault all` runs all seven faults end-to-end in one command.
+- Charts show all seven faults with correct per-fault colors and readable labels.
+- All unit tests pass.
+- results.csv contains rows for all seven faults.
+- Zero leftover resources after the full run.
+
+**How to verify:**
+```bash
+docker compose run lab python -m experiment.runner --fault all --trials 15
+docker compose run lab python -m experiment.results
+docker compose run lab python scripts/demo.py
+docker compose run lab python -m unittest discover tests -v
+```
+
+**What the student should learn:**
+- How to scale an experiment framework without duplicating code (extension points vs copies).
+- How chart design changes with more categories (horizontal bars, direct labels, per-fault colors).
+- End-to-end verification discipline: one command, all faults, clean state after.
+
+---
+
+## Phase 16: Final Docs + Cleanup Audit
+
+**Goal:** Update all final documentation for seven faults and run a last cleanliness audit.
+
+**Tasks:**
+- [x] Update `README.md`: seven faults, new charts, updated viva Q&A.
+- [x] Write `docs/process_hang_notes.md` (how injected, how detected, how recovered, what OS concept, observed numbers).
+- [x] Write `docs/disk_full_notes.md` (same structure).
+- [x] Write `docs/fd_exhaustion_notes.md` (same structure).
+- [x] Write `docs/zombie_leak_notes.md` (same structure).
+- [x] Final cleanup audit: unused-import check across the codebase.
+- [x] Final cleanup audit: leftover-resources check after a full run — no processes, no cgroups, no mounts, no zombies.
+- [x] Update all docs to reflect the final state (architecture.md, memory.md).
+
+**Files touched:** `README.md`, `docs/process_hang_notes.md`, `docs/disk_full_notes.md`, `docs/fd_exhaustion_notes.md`, `docs/zombie_leak_notes.md`, `docs/architecture.md`, `docs/memory.md`.
+
+**Definition of done:**
+- README reflects the seven-fault project with current charts and Q&A.
+- The four learning-notes files exist with observed numbers from real runs.
+- Unused-import check passes; no dead code.
+- After a full run: zero leftover processes, cgroups, mounts, zombies.
+- A student can clone the repo, run one command, and see all seven faults.
+
+**How to verify:**
+```bash
+docker compose run lab python -m experiment.runner --fault all --trials 15
+# Then verify: no leftover processes (ps), cgroups (ls /sys/fs/cgroup), mounts (mount), zombies.
+docker compose run lab python -m unittest discover tests -v
+```
+
+**What the student should learn:**
+- How to document a project for someone who has never seen it.
+- How to write learning notes from observed data (MTTD/MTTR numbers, ENOSPC/EMFILE observations).
+- How to audit a codebase for cleanliness (dead code, leftover resources).
+- Confidence to explain all seven faults in a viva.

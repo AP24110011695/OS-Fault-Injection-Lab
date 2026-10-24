@@ -60,7 +60,7 @@ When the user types `execute phaseN` (e.g., `execute phase3`):
   - If you believe a new library is truly necessary, you must:
     1. Write the justification in `memory.md` under "Decisions."
     2. Get explicit approval from the user before adding it.
-- **Do not add fault types** beyond: process kill, memory pressure, CPU hog.
+- **Do not add fault types** beyond the seven documented in `prd.md`: process kill, memory pressure, CPU hog, process hang, disk full, fd exhaustion, zombie leak.
 - **Do not add infrastructure** (Kubernetes, Grafana, web servers, databases, etc.).
 
 ---

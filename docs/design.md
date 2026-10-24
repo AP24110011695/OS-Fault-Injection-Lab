@@ -21,12 +21,17 @@ A small, muted palette. No neon, no gradients, no decorative color.
 | Accent 1 (primary)| Muted blue  | `#4A7C8F` | Process kill fault, primary action |
 | Accent 2          | Warm clay   | `#C47B5A` | Memory pressure fault |
 | Accent 3          | Sage green  | `#6B9080` | CPU hog fault |
+| Accent 4          | Muted violet| `#8B7BA5` | Process hang fault |
+| Accent 5          | Muted ochre | `#B49A5A` | Disk full fault |
+| Accent 6          | Dusty rose  | `#B07A8C` | FD exhaustion fault |
+| Accent 7          | Slate indigo| `#7080A0` | Zombie leak fault |
 | Error/failure     | Soft red    | `#B85450` | Failed trials, error states |
 | Success           | Muted teal  | `#5A8F7B` | Successful recovery |
 
 **Rules:**
 - Each fault type always uses its assigned color. No exceptions.
-- Never use more than 3 colors in one chart.
+- Charts comparing all seven faults use one color per fault (seven colors).
+- Every other chart never uses more than 3 colors.
 - Background is always `#FAFAF8`, never pure white (`#FFFFFF`).
 
 ---
@@ -76,6 +81,7 @@ if specific fonts are not installed in the Docker container. This is fine.
 
 3. **Direct labels over legends.**
    - If a chart has ≤3 series, label each bar/line directly.
+   - With seven faults, use horizontal bars and put the fault name at each bar as the direct label.
    - Use a legend only when direct labels would overlap or clutter.
 
 4. **Light gridlines.** Horizontal only (y-axis). Color: `#E0E0E0`. No vertical gridlines.
@@ -92,10 +98,11 @@ if specific fonts are not installed in the Docker container. This is fine.
 
 #### Chart 1: MTTD by Fault Type (grouped bar or box plot)
 
-- X-axis: fault type (process kill, memory pressure, CPU hog).
+- X-axis: fault type (all seven).
 - Y-axis: MTTD in seconds.
 - Show individual trial dots overlaid on the bar/box for transparency.
 - Title: a sentence summarizing the key insight.
+- With seven categories, prefer horizontal bars (fault names on the y-axis) so labels stay readable.
 
 #### Chart 2: MTTR by Fault Type (same format as Chart 1)
 
@@ -104,13 +111,14 @@ if specific fonts are not installed in the Docker container. This is fine.
 - X-axis: success rate (0%–100%).
 - Y-axis: fault type.
 - Direct label on each bar showing the percentage.
+- This layout scales well to seven faults; keep it for the all-fault comparison.
 
-#### Chart 4: MTTD vs. MTTR Scatter (optional, if informative)
+#### Chart 4: Recovery Cost After Detection (MTTR − MTTD, horizontal bar)
 
-- X-axis: MTTD.
-- Y-axis: MTTR.
-- Color-coded by fault type.
-- Only include if it reveals something useful (e.g., correlation).
+- Y-axis: fault type (all eight groups; process_hang appears once per strategy in its own color).
+- X-axis: recovery time in seconds (MTTR minus MTTD, per trial dots + mean bar).
+- This isolates what the recovery action itself costs, independent of each fault's detection ramp-up.
+- Replaces the earlier MTTD-vs-MTTR scatter (the horizontal-bar form carries the same information more readably for 7 faults).
 
 ### matplotlib Setup Code Pattern
 
@@ -148,6 +156,10 @@ FAULT_COLORS = {
     "process_kill": "#4A7C8F",
     "memory_pressure": "#C47B5A",
     "cpu_hog": "#6B9080",
+    "process_hang": "#8B7BA5",
+    "disk_full": "#B49A5A",
+    "fd_exhaustion": "#B07A8C",
+    "zombie_leak": "#7080A0",
 }
 ```
 
@@ -221,6 +233,6 @@ If built (low priority, Phase 10 stretch goal):
 - No "dashboard" aesthetic.
 - No decorative icons.
 - No color for decoration — only for information.
-- No more than 3 colors in any single chart.
+- No more than 3 colors in any single chart — except charts comparing all faults, which use one color per fault.
 - No legends when direct labels suffice.
 - No titles that describe the chart type instead of the finding.

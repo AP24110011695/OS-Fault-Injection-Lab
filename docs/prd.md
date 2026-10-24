@@ -16,7 +16,7 @@ Clarity and simplicity are requirements, not nice-to-haves.
 ## Goals
 
 1. Build a fault-injection framework that runs entirely inside Docker on Linux.
-2. Implement exactly three fault types: process kill, memory pressure, CPU hog.
+2. Implement seven fault types: process kill, memory pressure, CPU hog, process hang, disk full, fd exhaustion, zombie leak.
 3. For each fault, implement detection and automatic recovery.
 4. Measure **MTTD** (mean time to detect) and **MTTR** (mean time to recover) across multiple trials.
 5. Produce clean charts and a summary comparing fault types.
@@ -24,15 +24,15 @@ Clarity and simplicity are requirements, not nice-to-haves.
 
 ## Non-Goals
 
-- No Kubernetes, Chaos Mesh, eBPF, CRIU, ML/RL, custom kernels, or Grafana.
+- No network faults (latency, packet loss, partitioning), kernel/driver faults, Kubernetes, Chaos Mesh, eBPF, CRIU, ML/RL, custom kernels, or Grafana.
 - No web dashboard or interactive GUI.
-- No fault types beyond the three listed.
+- No fault types beyond the seven listed.
 - No libraries beyond the documented stack (psutil, stress-ng, matplotlib, standard library).
 - No host-level changes; everything runs inside the container.
 
 ---
 
-## The Three Faults
+## The Seven Faults
 
 ### 1. Process Kill
 
@@ -64,6 +64,46 @@ Clarity and simplicity are requirements, not nice-to-haves.
 | Recovery      | Kill the `stress-ng` process; optionally apply CPU cgroup throttling. |
 | Learning goal | CPU scheduling, nice/priority, cgroups CPU controller, load average vs. utilization. |
 
+### 4. Process Hang
+
+| Aspect        | Detail |
+|---------------|--------|
+| What breaks   | The target process is frozen with `SIGSTOP`: it stays alive but stops executing and stops producing heartbeats. |
+| Why it matters | Real services hang (deadlocks, blocked I/O) while still passing liveness checks — "alive" is not the same as "healthy". |
+| Detection     | Heartbeat staleness: the monitor checks the target's heartbeat file and detects when no fresh timestamp has been written within `HEARTBEAT_TIMEOUT_SEC`. A PID liveness check is deliberately **not** used — the PID is still alive, and that is the lesson of this fault. |
+| Recovery      | Two strategies are implemented and compared: **resume** (`SIGCONT`, verify heartbeats resume) and **restart** (`SIGKILL` + supervisor restart). `RECOVERED` is logged only after a fresh heartbeat is observed. MTTR is compared per strategy. |
+| Learning goal | Process states (running vs stopped), alive vs healthy, `SIGSTOP`/`SIGCONT`, heartbeat-based health checks. |
+
+### 5. Disk Full
+
+| Aspect        | Detail |
+|---------------|--------|
+| What breaks   | A small size-capped tmpfs (`DISK_FAULT_SIZE_MB`) is mounted inside the container and a writer process fills it until the OS returns `ENOSPC`. Before writing anything, the injector verifies via `/proc/mounts` that the path is really the tmpfs mountpoint; if the mount fails, the trial aborts. The container's normal filesystem is never written to. |
+| Why it matters | Full disks are one of the most common production failures; log growth and temp files are classic culprits. |
+| Detection     | `psutil.disk_usage(mount_path).percent` above `DISK_THRESHOLD_PERCENT` for N consecutive polls. |
+| Recovery      | Kill the writer, delete its files, verify usage drops below the threshold, then unmount the tmpfs in cleanup. |
+| Learning goal | Filesystems and mounts, tmpfs, `ENOSPC`, `df` vs `du`. |
+
+### 6. FD Exhaustion
+
+| Aspect        | Detail |
+|---------------|--------|
+| What breaks   | A leaker process (the faulty service) lowers **its own** limit with `resource.setrlimit(RLIMIT_NOFILE, FD_LIMIT)` and keeps opening files until it hits `EMFILE` (it handles the error and keeps running). The limit applies only to that process, never to the system. |
+| Why it matters | File-descriptor leaks are a classic slow-burn failure: the service works fine until it suddenly cannot open files or accept connections. |
+| Detection     | The leaker's open file count (`psutil.Process.num_fds()`) divided by its `RLIMIT_NOFILE` limit, above `FD_THRESHOLD_PERCENT` for N consecutive polls. |
+| Recovery      | Kill the leaking process, start a fresh clean instance, verify its fd count is low, then log `RECOVERED`. |
+| Learning goal | File descriptor table, `ulimit`/`RLIMIT_NOFILE`, `/proc/<pid>/fd`, `EMFILE`. |
+
+### 7. Zombie Leak
+
+| Aspect        | Detail |
+|---------------|--------|
+| What breaks   | A parent process spawns short-lived children that exit immediately and **never reaps them** (it never calls `wait`), so zombie processes pile up. The total is capped at `ZOMBIE_LEAK_MAX_CHILDREN` and children spawn at a controlled rate so the PID table is never at risk. |
+| Why it matters | Zombie accumulation signals a broken parent; in real systems it exhausts the process table and breaks process management. |
+| Detection     | Number of zombie children of the leaker parent (`psutil` status `STATUS_ZOMBIE`) above `ZOMBIE_THRESHOLD` for N consecutive polls. Only the leaker's children are counted so other processes cannot cause false alarms. |
+| Recovery      | Kill the parent. Orphaned zombies are adopted by PID 1 — in this container the Python runner, which may not reap them — so recovery verifies the zombies are really gone before logging `RECOVERED`. |
+| Learning goal | Zombies vs orphans, reparenting to PID 1, why init processes reap children. |
+
 ---
 
 ## Success Metrics
@@ -72,7 +112,8 @@ Clarity and simplicity are requirements, not nice-to-haves.
 |-------------------|-----------|--------|
 | MTTD              | `timestamp(DETECTED) - timestamp(INJECTED)` | Reported per trial and as a mean per fault type. |
 | MTTR              | `timestamp(RECOVERED) - timestamp(INJECTED)` | Reported per trial and as a mean per fault type. |
-| Success rate      | `trials where RECOVERED / total trials` | ≥ 90% for process kill and CPU hog; memory pressure may be lower due to OOM unpredictability — document why. |
+| Success rate      | `trials where RECOVERED / total trials` | ≥ 90% per fault type; memory pressure may be lower due to OOM unpredictability — document why. |
+| Strategy comparison | MTTR of the "resume" vs "restart" recovery strategies for process hang | Reported as a mean per strategy; document which recovers faster and why. |
 | Trial count       | Number of trials per fault type | 10–20 per fault type. |
 | Reproducibility   | Same command produces consistent results across runs | Variance in MTTD/MTTR should be explainable. |
 
@@ -129,12 +170,36 @@ docker compose run lab python -m experiment.runner --fault process_kill --trials
 - How `stress-ng` works internally (spawning worker threads).
 - Why a single 100%-CPU process does not necessarily freeze the system.
 
+### Process Hang
+- What process states exist (running, sleeping, stopped, zombie) and how `SIGSTOP`/`SIGCONT` move a process between them.
+- Why "the process is alive" and "the process is healthy" are different questions, and why liveness checks miss hangs.
+- How heartbeat-based health checks work and how the timeout trades detection speed against false positives.
+- Why recovery must be verified (a fresh heartbeat) before declaring success.
+
+### Disk Full
+- What filesystems and mount points are, and how mounting works in Linux.
+- What tmpfs is (RAM-backed filesystem) and why it makes disk-fault injection safe and disposable.
+- What `ENOSPC` is and how the OS reports "no space left on device".
+- What `df` and `du` measure and why they can disagree.
+
+### FD Exhaustion
+- What a file descriptor is and how each process owns an fd table.
+- What `ulimit`/`RLIMIT_NOFILE` control and that rlimits are per-process and inherited, not system-wide.
+- How to inspect open fds via `psutil` and `/proc/<pid>/fd`.
+- What `EMFILE` means and why leaking services fail slowly, then suddenly.
+
+### Zombie Leak
+- What a zombie process is (terminated but not reaped) and how it differs from an orphan.
+- How reparenting to PID 1 works when a parent dies.
+- Why init processes must reap children, and what accumulates when they do not.
+- How to count zombies precisely (only the target parent's children) to avoid false alarms.
+
 ---
 
 ## Constraints
 
 - All code is Python. No C, C++, Bash scripts for core logic (shell only for setup/convenience).
 - All experiments run inside Docker. Nothing modifies the host.
-- The codebase must be small: aim for under 1500 lines of Python total.
+- The codebase must stay small: under 3300 lines of Python excluding tests; each new fault module must stay small.
 - Every module must be independently runnable and testable.
 - The shared event log is the only communication mechanism between components.

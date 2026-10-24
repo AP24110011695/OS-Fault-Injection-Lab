@@ -12,19 +12,45 @@ from experiment.metrics import compute_aggregates
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-FAULT_COLORS: dict[str, str] = {
-    "process_kill": "#4A7C8F",
-    "memory_pressure": "#C47B5A",
-    "cpu_hog": "#6B9080",
-}
+# Chart groups: process_hang appears twice (one row per recovery strategy) and
+# both rows keep the fault's color, per design.md.
+GROUP_ORDER: list[str] = [
+    "process_kill",
+    "memory_pressure",
+    "cpu_hog",
+    "process_hang_resume",
+    "process_hang_restart",
+    "disk_full",
+    "fd_exhaustion",
+    "zombie_leak",
+]
 
-FAULT_LABELS: dict[str, str] = {
+GROUP_LABELS: dict[str, str] = {
     "process_kill": "Process Kill",
     "memory_pressure": "Memory Pressure",
     "cpu_hog": "CPU Hog",
+    "process_hang_resume": "Process Hang (resume)",
+    "process_hang_restart": "Process Hang (restart)",
+    "disk_full": "Disk Full",
+    "fd_exhaustion": "FD Exhaustion",
+    "zombie_leak": "Zombie Leak",
 }
 
-FAULT_ORDER: list[str] = ["process_kill", "memory_pressure", "cpu_hog"]
+GROUP_COLORS: dict[str, str] = {
+    "process_kill": "#4A7C8F",
+    "memory_pressure": "#C47B5A",
+    "cpu_hog": "#6B9080",
+    "process_hang_resume": "#8B7BA5",
+    "process_hang_restart": "#8B7BA5",
+    "disk_full": "#B49A5A",
+    "fd_exhaustion": "#B07A8C",
+    "zombie_leak": "#7080A0",
+}
+
+RAMP_UP_NOTE: str = (
+    "MTTD includes each fault's own ramp-up time (configured fill/leak/spawn speed) "
+    "plus the debounce, so use the recovery-time chart to compare recovery cost."
+)
 
 
 def apply_chart_style() -> None:
@@ -52,6 +78,12 @@ def apply_chart_style() -> None:
         "savefig.bbox": "tight",
         "savefig.facecolor": "#FAFAF8",
     })
+
+
+def group_of(trial_id: str) -> str:
+    """Chart group for a trial id: everything before the numeric suffix
+    (process_hang_resume_001 -> process_hang_resume)."""
+    return trial_id.rsplit("_", 1)[0]
 
 
 def write_results_csv(
@@ -125,212 +157,158 @@ def print_summary_table(fault_type: str, trial_metrics: list[dict[str, Any]]) ->
     print(f"\nResults saved to: {config.RESULTS_CSV_PATH}")
 
 
-def generate_mttd_chart(rows: list[dict[str, Any]], output_path: Path | str | None = None) -> Path:
+def _recovery_time(row: dict[str, Any]) -> float | None:
+    """Time from detection to recovery: what the recovery action itself costs."""
+    if row["mttd_sec"] is None or row["mttr_sec"] is None:
+        return None
+    return row["mttr_sec"] - row["mttd_sec"]
+
+
+def _grouped_metric(rows: list[dict[str, Any]], metric: str) -> dict[str, list[float]]:
+    """Per-group trial values for 'mttd_sec', 'mttr_sec', or 'recovery'."""
+    values: dict[str, list[float]] = {}
+    for r in rows:
+        value: float | None = _recovery_time(r) if metric == "recovery" else r[metric]
+        if value is not None:
+            values.setdefault(group_of(r["trial_id"]), []).append(value)
+    return values
+
+
+def _ordered_groups(values: dict[str, list[float]]) -> list[str]:
+    return [g for g in GROUP_ORDER if g in values]
+
+
+def _draw_group_bars(
+    groups: list[str],
+    means: list[float],
+    trial_values: list[list[float]],
+    xlabel: str,
+    title: str,
+    path: Path,
+    note: str | None = None,
+) -> Path:
+    """Horizontal bars with individual trial dots and direct value labels,
+    following design.md (one color per fault, direct labels, no legend)."""
     apply_chart_style()
-    path = Path(output_path or (config.RESULTS_DIR / "mttd_by_fault.png"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    faults = [f for f in FAULT_ORDER if any(r["fault_type"] == f for r in rows)]
-    means: list[float] = []
-    labels: list[str] = []
-    colors: list[str] = []
-    all_data: list[list[float]] = []
-
-    for f in faults:
-        f_mttds = [r["mttd_sec"] for r in rows if r["fault_type"] == f and r["mttd_sec"] is not None]
-        all_data.append(f_mttds)
-        means.append(sum(f_mttds) / len(f_mttds) if f_mttds else 0.0)
-        labels.append(FAULT_LABELS.get(f, f))
-        colors.append(FAULT_COLORS.get(f, "#4A7C8F"))
-
     fig, ax = plt.subplots(figsize=(8, 5))
-    x_positions = range(len(faults))
-    bars = ax.bar(x_positions, means, width=0.52, color=colors, zorder=2)
+    y_positions = range(len(groups))
+
+    ax.barh(y_positions, means, height=0.5, color=[GROUP_COLORS[g] for g in groups], zorder=2)
 
     rng = random.Random(42)
-    for i, points in enumerate(all_data):
-        jittered_x = [i + rng.uniform(-0.08, 0.08) for _ in points]
-        ax.scatter(jittered_x, points, color="#2D2D2D", alpha=0.55, s=28, zorder=3, linewidths=0)
+    for y, points in zip(y_positions, trial_values):
+        jittered_y = [y + rng.uniform(-0.14, 0.14) for _ in points]
+        ax.scatter(points, jittered_y, color="#2D2D2D", alpha=0.55, s=24, zorder=3, linewidths=0)
 
-    for bar, mean_val, points in zip(bars, means, all_data):
-        top_y = max(points) if points else bar.get_height()
-        ax.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            top_y + 0.06,
-            f"{mean_val:.2f}s",
-            ha="center",
-            va="bottom",
-            fontsize=10,
-            fontfamily="sans-serif",
-            color="#2D2D2D",
-        )
+    all_points = [p for points in trial_values for p in points]
+    x_max = max([max(means)] + all_points) if all_points else max(means)
+    for y, mean_val, points in zip(y_positions, means, trial_values):
+        label_x = max([mean_val] + points) + x_max * 0.02
+        ax.text(label_x, y, f"{mean_val:.2f}s", va="center", ha="left", fontsize=10,
+                fontfamily="sans-serif", color="#2D2D2D")
 
-    ax.set_xticks(list(x_positions))
-    ax.set_xticklabels(labels, fontsize=11)
-    ax.set_xlabel("Fault type", fontsize=11, labelpad=8)
-    ax.set_ylabel("Mean Time to Detect (seconds)", fontsize=11, labelpad=8)
-    y_max = max(max(pts) for pts in all_data) if all_data else 2.0
-    ax.set_ylim(0, y_max * 1.22)
+    ax.set_yticks(list(y_positions))
+    ax.set_yticklabels([GROUP_LABELS[g] for g in groups], fontsize=10)
+    ax.invert_yaxis()  # first group at the top
+    ax.set_xlabel(xlabel, fontsize=11, labelpad=8)
+    ax.set_ylabel("Fault type", fontsize=11, labelpad=8)
+    ax.grid(True, axis="x")  # grid along the value axis (horizontal bars)
+    ax.grid(False, axis="y")
+    ax.set_xlim(0, x_max * 1.22)
 
-    min_mean = min(means)
-    max_mean = max(means)
-    min_fault = labels[means.index(min_mean)]
-    max_fault = labels[means.index(max_mean)]
-    title_text = f"Detection Latency Spans {min_mean:.2f}s ({min_fault}) to {max_mean:.2f}s ({max_fault})"
-    ax.set_title(title_text, fontfamily="serif", fontsize=13, fontweight="bold", pad=16, color="#2D2D2D")
+    ax.set_title(title, fontfamily="serif", fontsize=13, fontweight="bold", pad=16, color="#2D2D2D")
+    if note:
+        fig.text(0.02, -0.04, note, fontsize=8, color="#6B6B6B", ha="left")
 
     fig.savefig(path)
     plt.close(fig)
     return path
+
+
+def generate_mttd_chart(rows: list[dict[str, Any]], output_path: Path | str | None = None) -> Path:
+    path: Path = Path(output_path or (config.RESULTS_DIR / "mttd_by_fault.png"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    values = _grouped_metric(rows, "mttd_sec")
+    groups = _ordered_groups(values)
+    means = [sum(values[g]) / len(values[g]) for g in groups]
+    fastest = groups[means.index(min(means))]
+    slowest = groups[means.index(max(means))]
+    title = f"Mean Detection Time Spans {min(means):.2f}s ({GROUP_LABELS[fastest]}) to {max(means):.2f}s ({GROUP_LABELS[slowest]})"
+
+    return _draw_group_bars(
+        groups, means, [values[g] for g in groups],
+        "Mean Time to Detect (seconds)", title, path, note=RAMP_UP_NOTE,
+    )
 
 
 def generate_mttr_chart(rows: list[dict[str, Any]], output_path: Path | str | None = None) -> Path:
-    apply_chart_style()
-    path = Path(output_path or (config.RESULTS_DIR / "mttr_by_fault.png"))
+    path: Path = Path(output_path or (config.RESULTS_DIR / "mttr_by_fault.png"))
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    faults = [f for f in FAULT_ORDER if any(r["fault_type"] == f for r in rows)]
-    means: list[float] = []
-    labels: list[str] = []
-    colors: list[str] = []
-    all_data: list[list[float]] = []
+    values = _grouped_metric(rows, "mttr_sec")
+    groups = _ordered_groups(values)
+    means = [sum(values[g]) / len(values[g]) for g in groups]
+    overall = sum(means) / len(means)
+    title = f"Recovery Averages {overall:.2f}s Across {len(groups)} Fault Groups"
 
-    for f in faults:
-        f_mttrs = [r["mttr_sec"] for r in rows if r["fault_type"] == f and r["mttr_sec"] is not None]
-        all_data.append(f_mttrs)
-        means.append(sum(f_mttrs) / len(f_mttrs) if f_mttrs else 0.0)
-        labels.append(FAULT_LABELS.get(f, f))
-        colors.append(FAULT_COLORS.get(f, "#4A7C8F"))
+    return _draw_group_bars(
+        groups, means, [values[g] for g in groups],
+        "Mean Time to Recover (seconds)", title, path,
+    )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    x_positions = range(len(faults))
-    bars = ax.bar(x_positions, means, width=0.52, color=colors, zorder=2)
 
-    rng = random.Random(42)
-    for i, points in enumerate(all_data):
-        jittered_x = [i + rng.uniform(-0.08, 0.08) for _ in points]
-        ax.scatter(jittered_x, points, color="#2D2D2D", alpha=0.55, s=28, zorder=3, linewidths=0)
+def generate_recovery_time_chart(rows: list[dict[str, Any]], output_path: Path | str | None = None) -> Path:
+    path: Path = Path(output_path or (config.RESULTS_DIR / "recovery_time_by_fault.png"))
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    for bar, mean_val, points in zip(bars, means, all_data):
-        top_y = max(points) if points else bar.get_height()
-        ax.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            top_y + 0.06,
-            f"{mean_val:.2f}s",
-            ha="center",
-            va="bottom",
-            fontsize=10,
-            fontfamily="sans-serif",
-            color="#2D2D2D",
-        )
+    values = _grouped_metric(rows, "recovery")
+    groups = _ordered_groups(values)
+    means = [sum(values[g]) / len(values[g]) for g in groups]
+    overall = sum(means) / len(means)
+    title = f"Recovery Cost Beyond Detection Averages {overall:.2f}s"
 
-    ax.set_xticks(list(x_positions))
-    ax.set_xticklabels(labels, fontsize=11)
-    ax.set_xlabel("Fault type", fontsize=11, labelpad=8)
-    ax.set_ylabel("Mean Time to Recover (seconds)", fontsize=11, labelpad=8)
-    y_max = max(max(pts) for pts in all_data) if all_data else 2.5
-    ax.set_ylim(0, y_max * 1.22)
-
-    overall_mean = sum(means) / len(means) if means else 0.0
-    title_text = f"Recovery Closely Mirrors Detection, Averaging {overall_mean:.2f}s Overall"
-    ax.set_title(title_text, fontfamily="serif", fontsize=13, fontweight="bold", pad=16, color="#2D2D2D")
-
-    fig.savefig(path)
-    plt.close(fig)
-    return path
+    return _draw_group_bars(
+        groups, means, [values[g] for g in groups],
+        "Recovery time after detection: MTTR - MTTD (seconds)", title, path,
+    )
 
 
 def generate_success_rate_chart(rows: list[dict[str, Any]], output_path: Path | str | None = None) -> Path:
-    apply_chart_style()
-    path = Path(output_path or (config.RESULTS_DIR / "success_rate.png"))
+    path: Path = Path(output_path or (config.RESULTS_DIR / "success_rate.png"))
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    faults = [f for f in FAULT_ORDER if any(r["fault_type"] == f for r in rows)]
-    rates: list[float] = []
-    labels: list[str] = []
-    colors: list[str] = []
-
-    for f in faults:
-        f_rows = [r for r in rows if r["fault_type"] == f]
-        successes = sum(1 for r in f_rows if r["success"])
-        rate = (successes / len(f_rows) * 100.0) if f_rows else 0.0
-        rates.append(rate)
-        labels.append(FAULT_LABELS.get(f, f))
-        colors.append(FAULT_COLORS.get(f, "#4A7C8F"))
-
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    y_positions = range(len(faults))
-    bars = ax.barh(y_positions, rates, height=0.45, color=colors, zorder=2)
-
-    for bar, rate_val in zip(bars, rates):
-        width = bar.get_width()
-        ax.text(
-            width + 1.5,
-            bar.get_y() + bar.get_height() / 2.0,
-            f"{rate_val:.1f}%",
-            ha="left",
-            va="center",
-            fontsize=10,
-            fontfamily="sans-serif",
-            color="#2D2D2D",
-        )
-
-    ax.set_yticks(list(y_positions))
-    ax.set_yticklabels(labels, fontsize=11)
-    ax.set_xlabel("Recovery success rate (%)", fontsize=11, labelpad=8)
-    ax.set_ylabel("Fault type", fontsize=11, labelpad=8)
-    ax.set_xlim(0, 115)
+    rates: dict[str, float] = {}
+    for g in {group_of(r["trial_id"]) for r in rows}:
+        g_rows = [r for r in rows if group_of(r["trial_id"]) == g]
+        rates[g] = sum(1 for r in g_rows if r["success"]) / len(g_rows) * 100.0
+    groups = _ordered_groups(rates)
 
     total_trials = len(rows)
-    overall_success = (sum(1 for r in rows if r["success"]) / total_trials * 100.0) if total_trials else 0.0
-    title_text = f"Automated Self-Healing Achieved {overall_success:.1f}% Success Across All {total_trials} Trials"
-    ax.set_title(title_text, fontfamily="serif", fontsize=13, fontweight="bold", pad=16, color="#2D2D2D")
+    overall = sum(1 for r in rows if r["success"]) / total_trials * 100.0
+    title = f"Automated Recovery Succeeded in {overall:.1f}% of {total_trials} Trials"
 
-    fig.savefig(path)
-    plt.close(fig)
-    return path
-
-
-def generate_scatter_chart(rows: list[dict[str, Any]], output_path: Path | str | None = None) -> Path:
     apply_chart_style()
-    path = Path(output_path or (config.RESULTS_DIR / "mttd_vs_mttr.png"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     fig, ax = plt.subplots(figsize=(8, 5))
+    y_positions = range(len(groups))
+    bars = ax.barh(y_positions, [rates[g] for g in groups], height=0.5,
+                   color=[GROUP_COLORS[g] for g in groups], zorder=2)
 
-    overheads: list[float] = []
-    faults = [f for f in FAULT_ORDER if any(r["fault_type"] == f for r in rows)]
-    for f in faults:
-        f_rows = [r for r in rows if r["fault_type"] == f and r["mttd_sec"] is not None and r["mttr_sec"] is not None]
-        xs = [r["mttd_sec"] for r in f_rows]
-        ys = [r["mttr_sec"] for r in f_rows]
-        overheads.extend([y - x for x, y in zip(xs, ys)])
-        ax.scatter(
-            xs,
-            ys,
-            color=FAULT_COLORS.get(f, "#4A7C8F"),
-            label=FAULT_LABELS.get(f, f),
-            alpha=0.85,
-            s=45,
-            zorder=3,
-        )
+    for bar, g in zip(bars, groups):
+        ax.text(bar.get_width() + 1.5, bar.get_y() + bar.get_height() / 2.0,
+                f"{rates[g]:.1f}%", va="center", ha="left", fontsize=10,
+                fontfamily="sans-serif", color="#2D2D2D")
 
-    mean_overhead = sum(overheads) / len(overheads) if overheads else 0.0
+    ax.set_yticks(list(y_positions))
+    ax.set_yticklabels([GROUP_LABELS[g] for g in groups], fontsize=10)
+    ax.invert_yaxis()  # first group at the top
+    ax.set_xlabel("Recovery success rate (%)", fontsize=11, labelpad=8)
+    ax.set_ylabel("Fault type", fontsize=11, labelpad=8)
+    ax.grid(True, axis="x")
+    ax.grid(False, axis="y")
+    ax.set_xlim(0, 115)
 
-    all_x = [r["mttd_sec"] for r in rows if r["mttd_sec"] is not None]
-    all_y = [r["mttr_sec"] for r in rows if r["mttr_sec"] is not None]
-    max_val = max(max(all_x), max(all_y)) * 1.08 if all_x and all_y else 2.5
-    ax.plot([0, max_val], [0, max_val], linestyle="--", color="#6B6B6B", linewidth=1.0, alpha=0.5, label="y = x (zero recovery lag)", zorder=2)
-
-    ax.set_xlim(0, max_val)
-    ax.set_ylim(0, max_val)
-    ax.set_xlabel("Mean Time to Detect (seconds)", fontsize=11, labelpad=8)
-    ax.set_ylabel("Mean Time to Recover (seconds)", fontsize=11, labelpad=8)
-    ax.legend(frameon=False, fontsize=9, loc="upper left")
-
-    title_text = f"MTTR is Governed by Detection Latency (Recovery Action Adds {mean_overhead:.2f}s)"
-    ax.set_title(title_text, fontfamily="serif", fontsize=13, fontweight="bold", pad=16, color="#2D2D2D")
-
+    ax.set_title(title, fontfamily="serif", fontsize=13, fontweight="bold", pad=16, color="#2D2D2D")
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -342,11 +320,12 @@ def generate_all_charts(csv_path: Path | str | None = None) -> list[Path]:
         print(f"[warning] No results found in {csv_path or config.RESULTS_CSV_PATH}")
         return []
 
-    c1 = generate_mttd_chart(rows)
-    c2 = generate_mttr_chart(rows)
-    c3 = generate_success_rate_chart(rows)
-    c4 = generate_scatter_chart(rows)
-    charts = [c1, c2, c3, c4]
+    charts = [
+        generate_mttd_chart(rows),
+        generate_mttr_chart(rows),
+        generate_recovery_time_chart(rows),
+        generate_success_rate_chart(rows),
+    ]
 
     print("\nCharts saved to:")
     for c in charts:
@@ -359,45 +338,24 @@ def print_comparison_summary(rows: list[dict[str, Any]]) -> None:
         print("No results available to summarize.")
         return
 
-    stats: dict[str, dict[str, Any]] = {}
-    for f in FAULT_ORDER:
-        f_rows = [r for r in rows if r["fault_type"] == f]
-        if f_rows:
-            stats[f] = compute_aggregates(f_rows)
-
+    groups = _ordered_groups(_grouped_metric(rows, "mttd_sec"))
     total_trials = len(rows)
+    overall_success = sum(1 for r in rows if r["success"]) / total_trials * 100.0
+
     print("\nComparison Summary")
-    print(f"--- ({total_trials} total trials across {len(stats)} fault types) ---")
+    print(f"--- ({total_trials} trials across {len(groups)} fault groups) ---\n")
+    print(f"  {'Fault group':<24}{'MTTD mean':>10} {'MTTR mean':>10} {'Recovery':>10} {'Success':>9}")
+    for g in groups:
+        g_rows = [r for r in rows if group_of(r["trial_id"]) == g]
+        aggr = compute_aggregates(g_rows)
+        recovery_cost = aggr["mttr_mean"] - aggr["mttd_mean"]
+        print(
+            f"  {GROUP_LABELS[g]:<24} {aggr['mttd_mean']:>9.3f} {aggr['mttr_mean']:>9.3f} "
+            f"{recovery_cost:>9.3f} {aggr['success_rate']:>8.1f}%"
+        )
 
-    if "process_kill" in stats:
-        pk = stats["process_kill"]
-        overhead_pk = pk["mttr_mean"] - pk["mttd_mean"]
-        print(f"\n1. Process Kill (Fastest detection: mean MTTD {pk['mttd_mean']:.3f}s)")
-        print("   - Mechanism: os.kill(pid, SIGKILL) instantly terminates target execution (< 1ms).")
-        print(f"   - Polling impact: Detected on the next monitor check; MTTD represents pure polling")
-        print(f"     phase offset uniformly distributed in [0, {config.MONITOR_POLL_INTERVAL_SEC:.1f}s] (mean ~0.25s).")
-        print(f"   - Recovery: Supervisor restarted target and verified liveness in {overhead_pk:.3f}s.")
-
-    if "memory_pressure" in stats:
-        mp = stats["memory_pressure"]
-        overhead_mp = mp["mttr_mean"] - mp["mttd_mean"]
-        print(f"\n2. Memory Pressure (Moderate detection: mean MTTD {mp['mttd_mean']:.3f}s)")
-        print(f"   - Mechanism: Memory hog allocates 8MB bytearrays every 50ms inside cgroup (limit {config.CGROUP_MEMORY_LIMIT_MB}MB).")
-        print("   - Ramp-up impact: Takes ~0.40s of physical allocation ramp-up before the kernel OOM killer")
-        print("     triggers. MTTD includes both physical allocation ramp-up and polling delay.")
-        print(f"   - Recovery: Hog was OOM-killed; cgroup unlinked and removed in {overhead_mp:.3f}s.")
-
-    if "cpu_hog" in stats:
-        ch = stats["cpu_hog"]
-        overhead_ch = ch["mttr_mean"] - ch["mttd_mean"]
-        print(f"\n3. CPU Hog (Debounced detection: mean MTTD {ch['mttd_mean']:.3f}s)")
-        print(f"   - Mechanism: stress-ng spawns {config.STRESS_NG_CPU_WORKERS} workers saturating 100% of available CPU cores.")
-        print(f"   - Debounce impact: Detector requires {config.CONSECUTIVE_POLLS_THRESHOLD} consecutive polls above {config.CPU_THRESHOLD_PERCENT:.1f}% CPU to avoid")
-        print(f"     false alarms from transient bursts. 3 polls at {config.MONITOR_POLL_INTERVAL_SEC:.1f}s establish a minimum 1.50s baseline.")
-        print(f"   - Recovery: Workers terminated recursively and CPU normalized in {overhead_ch:.3f}s.")
-
-    overall_success = (sum(1 for r in rows if r["success"]) / total_trials) * 100.0
-    print(f"\nOverall Self-Healing Performance: {overall_success:.1f}% success rate across all trials.")
+    print(f"\n  Overall success rate: {overall_success:.1f}%")
+    print(f"  Note: {RAMP_UP_NOTE}")
     print("---")
 
 

@@ -9,6 +9,7 @@ import psutil
 
 import config
 import event_log
+from injector.disk_full import is_tmpfs_mount
 from monitor.detector import is_process_alive
 from recovery.supervisor import restart_target
 
@@ -182,6 +183,153 @@ def recover_cpu(
         fault_type="cpu_hog",
         event="RECOVERED",
         details=f"stress-ng terminated; CPU normalized to {current_cpu:.1f}%",
+    )
+    return True
+
+
+def kill_writer(writer_proc: subprocess.Popen[Any] | None) -> None:
+    if writer_proc is None or writer_proc.poll() is not None:
+        return
+    try:
+        writer_proc.terminate()
+        writer_proc.wait(timeout=1.0)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            writer_proc.kill()
+            writer_proc.wait(timeout=1.0)
+        except OSError:
+            pass
+
+
+def delete_mount_files(mount_path: Path) -> int:
+    removed: int = 0
+    if not mount_path.exists():
+        return 0
+    for f in mount_path.iterdir():
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def recover_disk_full(
+    trial_id: str,
+    mount_path: Path,
+    writer_proc: subprocess.Popen[Any] | None = None,
+) -> bool:
+    # 1. Kill the writer so nothing recreates files while we clean up
+    kill_writer(writer_proc)
+
+    # 2. Delete the writer's files
+    removed: int = delete_mount_files(mount_path)
+
+    # 3. Verify usage drops below the threshold (retry briefly to let deletes settle)
+    percent: float = 100.0
+    for _ in range(5):
+        try:
+            percent = psutil.disk_usage(str(mount_path)).percent
+        except (OSError, psutil.Error):
+            percent = 0.0
+            break
+        if percent < config.DISK_THRESHOLD_PERCENT:
+            break
+        time.sleep(0.1)
+
+    if percent >= config.DISK_THRESHOLD_PERCENT:
+        error_msg: str = f"Recovery failed: disk usage still {percent:.1f}% after deleting {removed} file(s)"
+        event_log.log_event(trial_id=trial_id, fault_type="disk_full", event="FAILED", details=error_msg)
+        raise RuntimeError(error_msg)
+
+    event_log.log_event(
+        trial_id=trial_id,
+        fault_type="disk_full",
+        event="RECOVERED",
+        details=f"Writer terminated; {removed} file(s) deleted; disk usage normalized to {percent:.1f}%",
+    )
+    return True
+
+
+def cleanup_fault_disk(
+    mount_path: Path,
+    writer_proc: subprocess.Popen[Any] | None = None,
+) -> bool:
+    """Full cleanup after every trial (also on failure paths and Ctrl+C):
+    kill the writer, delete its files, umount, remove the directory, and verify
+    via /proc/mounts that the path is no longer mounted."""
+    kill_writer(writer_proc)
+    delete_mount_files(mount_path)
+
+    for _ in range(5):
+        if not is_tmpfs_mount(mount_path):
+            break
+        try:
+            subprocess.run(["umount", str(mount_path)], capture_output=True, text=True, timeout=10)
+        except OSError:
+            pass
+        time.sleep(0.1)
+
+    if not is_tmpfs_mount(mount_path):
+        try:
+            mount_path.rmdir()
+        except OSError:
+            pass
+
+    return not is_tmpfs_mount(mount_path) and not mount_path.exists()
+
+
+def count_zombies() -> int:
+    return sum(
+        1 for p in psutil.process_iter(["status"])
+        if (p.info.get("status") or "") == psutil.STATUS_ZOMBIE
+    )
+
+
+def recover_zombie_leak(
+    trial_id: str,
+    pid: int,
+    leaker_proc: subprocess.Popen[Any] | None = None,
+) -> bool:
+    """Kill the leaker parent (and reap it), reap the zombies it orphaned to PID 1,
+    and log RECOVERED only after the container really has zero zombies left."""
+    # 1. Kill the leaker parent and reap it
+    if leaker_proc is not None:
+        if leaker_proc.poll() is None:
+            try:
+                leaker_proc.kill()
+                leaker_proc.wait(timeout=1.0)
+            except OSError:
+                pass
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    # 2. Orphaned zombies are adopted by PID 1 (this Python runner), which does not
+    #    reap automatically — reap them explicitly.
+    reap_zombie_children()
+
+    # 3. Verify zero zombies remain (reparenting is asynchronous; retry briefly)
+    zombies: int = -1
+    for _ in range(5):
+        zombies = count_zombies()
+        if zombies == 0:
+            break
+        reap_zombie_children()
+        time.sleep(0.1)
+
+    if zombies != 0:
+        error_msg: str = f"Recovery failed: {zombies} zombie process(es) remain after reaping"
+        event_log.log_event(trial_id=trial_id, fault_type="zombie_leak", event="FAILED", details=error_msg)
+        raise RuntimeError(error_msg)
+
+    event_log.log_event(
+        trial_id=trial_id,
+        fault_type="zombie_leak",
+        event="RECOVERED",
+        details=f"Leaker parent PID {pid} killed and reaped; orphaned zombies reaped; 0 zombies remain",
     )
     return True
 

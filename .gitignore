@@ -2,6 +2,7 @@
 results/*.jsonl
 results/*.csv
 results/*.png
+results/*.log
 !results/.gitkeep
 
 # Python cache

@@ -23,7 +23,8 @@ def main() -> None:
     print("==================================================")
     print("  OS Fault Injection Lab — Interactive Demo")
     print("==================================================")
-    print(f"Executing demonstration run with {args.trials} trial(s) per fault type.\n")
+    print(f"Executing demonstration run with {args.trials} trial(s) per fault group")
+    print("(7 faults; process_hang runs both recovery strategies).\n")
 
     run_all_experiments(trial_count=args.trials)
 

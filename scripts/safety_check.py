@@ -1,7 +1,15 @@
 import importlib
 import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+# Ensure project root is importable when executed directly as a script
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from injector.disk_full import is_tmpfs_mount
 
 
 def is_inside_docker() -> bool:
@@ -38,6 +46,31 @@ def is_psutil_available() -> bool:
         return False
 
 
+def is_tmpfs_mounting_available() -> bool:
+    """Mount a 1MB tmpfs, verify it via /proc/mounts, and clean it up —
+    leaving nothing behind whether the check passes or fails."""
+    mount_path = Path("/tmp/safety_check_tmpfs")
+    mounted = False
+    try:
+        mount_path.mkdir(parents=True, exist_ok=True)
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["mount", "-t", "tmpfs", "-o", "size=1m", "tmpfs", str(mount_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        mounted = result.returncode == 0 and is_tmpfs_mount(mount_path, expected_size_mb=1)
+        return mounted
+    except OSError:
+        return False
+    finally:
+        subprocess.run(["umount", str(mount_path)], capture_output=True, text=True, timeout=10)
+        try:
+            mount_path.rmdir()
+        except OSError:
+            pass
+
+
 def verify_docker_environment(verbose: bool = False) -> None:
     if not is_inside_docker():
         print(
@@ -71,12 +104,21 @@ def verify_docker_environment(verbose: bool = False) -> None:
         )
         sys.exit(1)
 
+    if not is_tmpfs_mounting_available():
+        print(
+            "ERROR: tmpfs mounting is not available (required by the disk_full fault).\n"
+            "       Ensure the container runs privileged and 'mount' is installed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if verbose:
         print("[x] Docker environment verified")
         print("[x] cgroups v2 available (/sys/fs/cgroup)")
         print("[x] stress-ng binary available")
         print("[x] psutil library importable")
-    print("OK: Safety checks passed (Docker, cgroups v2, stress-ng, psutil)")
+        print("[x] tmpfs mounting available (verified and cleaned up)")
+    print("OK: Safety checks passed (Docker, cgroups v2, stress-ng, psutil, tmpfs mount)")
 
 
 if __name__ == "__main__":
