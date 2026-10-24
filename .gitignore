@@ -11,3 +11,6 @@ __pycache__/
 
 # Environment
 .env
+
+# Private study notes (never pushed)
+docs/private/
