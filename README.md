@@ -124,16 +124,16 @@ Computed from `results/results.csv` — 120 trials across 8 groups (7 faults; pr
 
 | Fault group | MTTD mean (s) | MTTR mean (s) | Recovery cost (s) | Success |
 |---|---|---|---|---|
-| Process Kill | 0.258 | 0.365 | 0.107 | 100% |
-| Memory Pressure | 0.733 | 0.739 | 0.006 | 100% |
-| CPU Hog | 1.760 | 1.883 | 0.123 | 100% |
-| Process Hang (resume) | 3.016 | 3.059 | 0.043 | 100% |
-| Process Hang (restart) | 3.149 | 3.259 | 0.110 | 100% |
-| Disk Full | 1.953 | 1.963 | 0.010 | 100% |
-| FD Exhaustion | 5.968 | 6.082 | 0.114 | 100% |
-| Zombie Leak | 2.327 | 2.334 | 0.007 | 100% |
+| Process Kill | 0.199 | 0.306 | 0.107 | 100% |
+| Memory Pressure | 0.764 | 0.769 | 0.005 | 100% |
+| CPU Hog | 1.735 | 1.855 | 0.120 | 100% |
+| Process Hang (resume) | 3.297 | 3.306 | 0.009 | 100% |
+| Process Hang (restart) | 3.133 | 3.242 | 0.109 | 100% |
+| Disk Full | 1.961 | 1.971 | 0.009 | 100% |
+| FD Exhaustion | 5.908 | 6.017 | 0.109 | 100% |
+| Zombie Leak | 2.332 | 2.338 | 0.006 | 100% |
 
-MTTD includes each fault's own ramp-up time (configured fill/leak/spawn speed) plus the detection debounce, so it is not a fair measure of recovery quality — recovery cost (MTTR − MTTD) is compared in the recovery-time chart, and it sits between 0.006s and 0.123s for every fault.
+MTTD includes each fault's own ramp-up time (configured fill/leak/spawn speed) plus the detection debounce, so it is not a fair measure of recovery quality — recovery cost (MTTR − MTTD) is compared in the recovery-time chart, and it sits between 0.005s and 0.120s for every fault.
 
 ---
 
@@ -156,7 +156,7 @@ Written honestly:
 - **One container, one laptop.** All faults are controlled simulations inside a single Docker container on one machine. Absolute numbers (MTTD/MTTR) vary with the host — the *relative* differences and mechanisms are the findings, not the milliseconds.
 - **15 trials per group.** Enough to show a stable distribution, not a rigorous statistical study.
 - **100% success ≠ real-world robustness.** The recovery mechanisms work for the faults as injected; real failures arrive with partial state, concurrent causes, and network effects that this lab does not model.
-- **Resume vs restart is within noise.** The two process_hang strategies differ by ~0.07s in recovery cost — not a meaningful gap; the interesting difference (resume keeps possibly-corrupt state) is qualitative, not measured here.
+- **Resume vs restart: MTTR flips, recovery cost does not.** The MTTR difference between the two process_hang strategies is dominated by detection-time variance and flips between runs, but the recovery action cost itself differs consistently (resume about 0.01s, restart about 0.1s) because restarting has to launch a new process. The interesting qualitative difference — resume keeps possibly-corrupt state — is not measured here.
 - **One fault at a time.** Faults are never combined; cascading failures are out of scope.
 
 ---
